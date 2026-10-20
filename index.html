@@ -306,7 +306,7 @@ tr:nth-child(even) td{background:#fafafa}
     </div>
     <div class="portal-form" id="portal-personal-form" autocomplete="off">
       <div class="field"><label>个人账号（考勤表里的学号）</label><input type="text" id="pp-account" placeholder="账号为 G2025 开头的 8 位学号" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></div>
-      <div class="field-tip" style="font-size:11px;color:#6b7280;margin:-6px 0 8px 2px">账号 = <b>G2025 开头的 8 位学号</b>（向老师或班级名单要）；<br>密码 = <b>7 + 三位考勤号</b>（即班级名单里你那一行的 3 位数字，例如 001、011 等）。</div>
+      <div class="field-tip" style="font-size:11px;color:#6b7280;margin:-6px 0 8px 2px">账号 = <b>G2025 开头的 8 位学号</b>（向老师或班级名单要）；<br>密码 = <b>身份证号后六位</b>（最后一位若是字母 X，大写小写都能登录）。</div>
       <div class="field"><label>个人密码</label><input type="password" id="pp-pass" placeholder="请输入个人密码" autocomplete="new-password"></div>
       <div class="row" style="justify-content:flex-end"><button class="btn" id="pp-login">登录</button></div>
       <div class="portal-tip" id="pp-tip" style="color:var(--red);display:none"></div>
@@ -325,7 +325,7 @@ const KEY_PERSONAL_SID='qiwu7_personal_sid_v1';
 const DEVICE_KEY='qiwu7_device_v1';       // 本机设备编号
 const PIN_KEY='qiwu7_pin_v1';             // 学生端敏感操作 PIN 码
 const SYNC_VER=2;                          // 同步文件格式版本（R24：服务器按设备分槽存储）
-const BUILD_VERSION='v1.14-2026-10-18-r25c';  // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
+const BUILD_VERSION='v1.15-2026-10-20-r26';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
 const BUILD_VERSION_KEY='qiwu7_build_v1';
 const pad2=n=>n<10?'0'+n:''+n;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -565,8 +565,12 @@ function defaultState(){
     rulesUpdatedAt:0,        // 条例最后编辑时间
     /* ===== M7 个人成长报告 ===== */
     growthEdits:{},          // {studentId: editedText} 班主任对系统生成的报告手动修改后的版本
-    pushedGrowth:{},         // {studentId: true} 教师端确认推送过的成长报告
-    pushedReport:{},         // {studentId: true} 教师端确认推送过的成绩报告
+    /* R26：pushedGrowth/pushedReport 的值改为「推送时刻时间戳」，撤回则写墓碑时间戳；
+       可见 = 已推送 && 推送时刻 >= 撤回时刻。旧的 true 会在迁移里转成时间戳。 */
+    pushedGrowth:{},         // {studentId: pushTs} 教师端确认推送过的成长报告
+    pushedReport:{},         // {studentId: pushTs} 教师端确认推送过的成绩报告
+    pushedGrowthTomb:{},     // {studentId: withdrawTs} 成长报告撤回墓碑（防同步复活）
+    pushedReportTomb:{},     // {studentId: withdrawTs} 成绩报告撤回墓碑（防同步复活）
     /* ===== M8/M9 奖品兑换 ===== */
     prizes:[],               // [{id,name,cost,stock,active,desc,ts}]
     prizeOrders:[],          // [{id,sid,name,prizeId,prizeName,cost,ts,status:'pending'|'approved'|'rejected',statusTs}]
@@ -585,42 +589,105 @@ function defaultState(){
 }
 var state=defaultState();
 
+/* ================= R26 · 报告「推送 / 撤回」（时间戳墓碑版） =================
+   旧版 pushedXxx 存 true，撤回无从下手。R26 改为：
+     pushedXxx[sid]      = 最后一次推送的时刻（毫秒）
+     pushedXxxTomb[sid]  = 最后一次撤回的时刻（毫秒）
+   可见 = 有推送时刻 && 推送时刻 >= 撤回时刻。
+   撤回时强制 tomb = max(now, pushTs+1)，避免同毫秒导致撤回失效。
+   两套时间戳都进同步包，合并取「各自最大值」，保证三端一致、且撤回不会被推送复活。 */
+function migratePushTsR26(){
+  const t=Date.now();
+  [['pushedReport','pushedReportTomb'],['pushedGrowth','pushedGrowthTomb']].forEach(pair=>{
+    const m=state[pair[0]]||{}, tb=state[pair[1]]||{};
+    Object.keys(m).forEach(k=>{
+      const v=m[k];
+      if(v===true||v===1) m[k]=t;                       /* 旧存档 true → 推送时间戳 */
+      else if(typeof v!=='number'||!isFinite(v)) m[k]=+(v||0)||0;
+    });
+    Object.keys(tb).forEach(k=>{ if(typeof tb[k]!=='number'||!isFinite(tb[k])) tb[k]=+(tb[k]||0)||0; });
+    state[pair[0]]=m; state[pair[1]]=tb;
+  });
+}
+/* 成绩报告：该生当前是否可见（= 已推送且未被撤回） */
+function reportPushed(sid){
+  const p=+(state.pushedReport||{})[sid]||0;
+  const t=+(state.pushedReportTomb||{})[sid]||0;
+  return p>0 && t<=p;
+}
+/* 成长报告：该生当前是否可见 */
+function growthPushed(sid){
+  const p=+(state.pushedGrowth||{})[sid]||0;
+  const t=+(state.pushedGrowthTomb||{})[sid]||0;
+  return p>0 && t<=p;
+}
+/* 推送 / 撤回 —— 成绩报告 */
+function pushReport(sid){
+  state.pushedReport=state.pushedReport||{};
+  state.pushedReportTomb=state.pushedReportTomb||{};
+  state.pushedReport[sid]=Math.max(Date.now(),(+state.pushedReportTomb[sid]||0)+1);
+  delete state.pushedReportTomb[sid];
+}
+function withdrawReport(sid){
+  state.pushedReportTomb=state.pushedReportTomb||{};
+  state.pushedReportTomb[sid]=Math.max(Date.now(),(+(state.pushedReport||{})[sid]||0)+1);
+}
+/* 推送 / 撤回 —— 成长报告 */
+function pushGrowth(sid){
+  state.pushedGrowth=state.pushedGrowth||{};
+  state.pushedGrowthTomb=state.pushedGrowthTomb||{};
+  state.pushedGrowth[sid]=Math.max(Date.now(),(+state.pushedGrowthTomb[sid]||0)+1);
+  delete state.pushedGrowthTomb[sid];
+}
+function withdrawGrowth(sid){
+  state.pushedGrowthTomb=state.pushedGrowthTomb||{};
+  state.pushedGrowthTomb[sid]=Math.max(Date.now(),(+(state.pushedGrowth||{})[sid]||0)+1);
+}
+/* 同步包合并：两套时间戳各自取最大值（撤回不会被对端的旧推送覆盖） */
+function mergePushField(dst,dstTomb,src,srcTomb){
+  Object.keys(src||{}).forEach(k=>{ const v=+(src[k]||0)||0; if(v>(+(dst[k]||0)||0))dst[k]=v; });
+  Object.keys(srcTomb||{}).forEach(k=>{ const v=+(srcTomb[k]||0)||0; if(v>(+(dstTomb[k]||0)||0))dstTomb[k]=v; });
+}
+
 /* ================= 三端账号体系 ================= */
 // 47 人姓名 → 学生号 / 密码 / 拼音映射表（个人端账号用）
-// 账号 = G2025 开头的 8 位学号（来自考勤表第一列），密码 = 7 + 三位考勤号（按名单顺序 7001 ~ 7049）
+// 账号 = G2025 开头的 8 位学号（来自考勤表第一列），密码 = 身份证号后六位（R26 起，字母不分大小写）
 // 拼音小写（r[4]）保留作为兼容兜底
 const PINYIN_MAP=[
-  [1,"曾凌峰","G20250024","7001","zenglingfeng"],[2,"陈恒贤","G20250045","7002","chenhengxian"],[3,"陈锦仪","G20250051","7003","chenjinyi"],[4,"陈可昕","G20250055","7004","chenkexin"],
-  [5,"范志宸","G20250132","7005","fanzhichen"],[6,"葛斯凯","G20250157","7006","gesikai"],[7,"郭子墉","G20250169","7007","guoziyong"],[8,"贺奕昕","G20250191","7008","heyixin"],
-  [9,"侯宇轩","G20250195","7009","houyuxuan"],[10,"黄炜桐","G20250221","7010","huangweitong"],[11,"蒋鹏杰","G20250246","7011","jiangpengjie"],[12,"蒋西","G20250247","7012","jiangxi"],
-  [14,"赖昕睿","G20250259","7014","laixinrui"],[15,"赖梓安","G20250261","7015","laizian"],[16,"勒栀","G20250264","7016","leizhi"],[17,"黎科麟","G20250268","7017","likelin"],
-  [18,"李佳琪","G20250290","7018","lijiaqi"],[19,"李雨函","G20250324","7019","liyuhan"],[20,"李子博","G20250335","7020","lizibo"],[21,"梁创尧","G20250344","7021","liangchuangyao"],
-  [22,"梁睿桐","G20250348","7022","liangruitong"],[23,"刘芷伶","G20250417","7023","liuzhiling"],[24,"刘子懿","G20250423","7024","liuziyi"],[25,"卢梓盈","G20250434","7025","luziying"],
-  [27,"吕垭萱","G20250449","7027","lvyaxuan"],[28,"彭韵旋","G20250483","7028","pengyunxuan"],[29,"施雅剑","G20250505","7029","shiyajian"],[30,"万可馨","G20250544","7030","wankexin"],
-  [31,"王宇","G20250563","7031","wangyu"],[32,"王振宇","G20250568","7032","wangzhenyu"],[33,"陈沛业","G20250061","7033","chenpeiye"],[34,"吴欣洡","G20250599","7034","wuxinlei"],
-  [35,"肖皓轩","G20250614","7035","xiaohaoxuan"],[36,"肖茜文","G20250615","7036","xiaoqianwen"],[37,"谢家和","G20250625","7037","xiejiahe"],[38,"徐睿涵","G20250649","7038","xuruihan"],
-  [39,"许卓凡","G20250659","7039","xuzhuofan"],[40,"尹鹏皓","G20250711","7040","yinpenghao"],[41,"张斐然","G20250747","7041","zhangfeiran"],[42,"张涵","G20250750","7042","zhanghan"],
-  [43,"张喆祎","G20250784","7043","zhangzheyi"],[44,"张志朋","G20250786","7044","zhangzhipeng"],[45,"赵俊哲","G20250795","7045","zhaojunzhe"],[46,"郑其","G20250804","7046","zhengqi"],
-  [47,"钟明邦","G20250812","7047","zhongmingbang"],[48,"周博文","G20250818","7048","zhoubowen"],[49,"周雨轩","G20250833","7049","zhouyuxuan"]
+  [1,"曾凌峰","G20250024","7001","zenglingfeng","16003X"],[2,"陈恒贤","G20250045","7002","chenhengxian","073033"],[3,"陈锦仪","G20250051","7003","chenjinyi","273940"],[4,"陈可昕","G20250055","7004","chenkexin","191843"],
+  [5,"范志宸","G20250132","7005","fanzhichen","240232"],[6,"葛斯凯","G20250157","7006","gesikai","030456"],[7,"郭子墉","G20250169","7007","guoziyong","010311"],[8,"贺奕昕","G20250191","7008","heyixin","14002X"],
+  [9,"侯宇轩","G20250195","7009","houyuxuan","150216"],[10,"黄炜桐","G20250221","7010","huangweitong","140505"],[11,"蒋鹏杰","G20250246","7011","jiangpengjie","102030"],[12,"蒋西","G20250247","7012","jiangxi","270807"],
+  [14,"赖昕睿","G20250259","7014","laixinrui","281850"],[15,"赖梓安","G20250261","7015","laizian","165913"],[16,"勒栀","G20250264","7016","leizhi","137045"],[17,"黎科麟","G20250268","7017","likelin","288577"],
+  [18,"李佳琪","G20250290","7018","lijiaqi","25122X"],[19,"李雨函","G20250324","7019","liyuhan","014521"],[20,"李子博","G20250335","7020","lizibo","145117"],[21,"梁创尧","G20250344","7021","liangchuangyao","21107X"],
+  [22,"梁睿桐","G20250348","7022","liangruitong","184120"],[23,"刘芷伶","G20250417","7023","liuzhiling","054322"],[24,"刘子懿","G20250423","7024","liuziyi","171018"],[25,"卢梓盈","G20250434","7025","luziying","170267"],
+  [27,"吕垭萱","G20250449","7027","lvyaxuan","040025"],[28,"彭韵旋","G20250483","7028","pengyunxuan","120825"],[29,"施雅剑","G20250505","7029","shiyajian","154710"],[30,"万可馨","G20250544","7030","wankexin","138084"],
+  [31,"王宇","G20250563","7031","wangyu","245150"],[32,"王振宇","G20250568","7032","wangzhenyu","040079"],[33,"陈沛业","G20250061","7033","chenpeiye","030479"],[34,"吴欣洡","G20250599","7034","wuxinlei","250155"],
+  [35,"肖皓轩","G20250614","7035","xiaohaoxuan","211811"],[36,"肖茜文","G20250615","7036","xiaoqianwen","130087"],[37,"谢家和","G20250625","7037","xiejiahe","225773"],[38,"徐睿涵","G20250649","7038","xuruihan","308829"],
+  [39,"许卓凡","G20250659","7039","xuzhuofan","220052"],[40,"尹鹏皓","G20250711","7040","yinpenghao","082316"],[41,"张斐然","G20250747","7041","zhangfeiran","121628"],[42,"张涵","G20250750","7042","zhanghan","250392"],
+  [43,"张喆祎","G20250784","7043","zhangzheyi","220557"],[44,"张志朋","G20250786","7044","zhangzhipeng","093098"],[45,"赵俊哲","G20250795","7045","zhaojunzhe","210831"],[46,"郑其","G20250804","7046","zhengqi","314412"],
+  [47,"钟明邦","G20250812","7047","zhongmingbang","243877"],[48,"周博文","G20250818","7048","zhoubowen","16031X"],[49,"周雨轩","G20250833","7049","zhouyuxuan","21006X"]
 ];
-// 个人端密码格式：'7' + 两位考勤序号（如 1 号 → 701，43 号 → 743）
+// 个人端密码格式：身份证号后六位（如 16003X，字母不分大小写）
 // 校验个人端账号密码
 function checkPersonalAccount(account,pass){
   const acc=(account||'').trim().toLowerCase();
   const p=(pass||'').trim();
+  const pu=p.toUpperCase();                 /* 末位 X 大小写通吃 */
   /* 默认 state 未初始化（个人端测试 / 首次启动） */
   try{if(typeof state==='undefined'||!state||!state.students||!state.students.length)return {ok:false};}catch(_){return {ok:false};}
   for(const r of PINYIN_MAP){
     /* r[2]=学生号（如 G20250024），r[4]=拼音小写（兜底兼容）
-       老师 10-15 更新：账号统一用「考勤表的学生号」，密码仍是「7+序号三位」（如 7001） */
+       R26（2026-10-20）：密码改为「身份证号后六位」r[5]，旧密码 7+序号 已作废 */
     const matchAcct=(r[2] && r[2].toLowerCase()===acc) || (r[4] && r[4]===acc);
-    if(matchAcct && r[3]===p){
-      /* PINYIN_MAP 的 r[0] 是考勤序号（可能跳号），与 buildStudents 的 list index 不同；
-         必须按姓名在 state.students 反查 sidOf，避免 sid 不一致导致教师端推送接收方对不上 */
-      const stu=state.students.find(s=>s.name===r[1]);
-      if(!stu)return {ok:false};
-      return {ok:true,sid:stu.id,name:r[1]};
-    }
+    if(!matchAcct)continue;
+    const realPwd=(r[5]||'').toUpperCase();
+    if(!realPwd)continue;                   /* 该生无身份证后六位 → 不允许登录 */
+    if(pu!==realPwd)continue;
+    /* PINYIN_MAP 的 r[0] 是考勤序号（可能跳号），与 buildStudents 的 list index 不同；
+       必须按姓名在 state.students 反查 sidOf，避免 sid 不一致导致教师端推送接收方对不上 */
+    const stu=state.students.find(s=>s.name===r[1]);
+    if(!stu)return {ok:false};
+    return {ok:true,sid:stu.id,name:r[1]};
   }
   return {ok:false};
 }
@@ -641,9 +708,10 @@ function personalOfSid(sid){
 function checkRoomScorePwd(pass){
   const p=(pass||'').trim();
   if(!p)return {ok:false};
-  /* 只根据密码反查：白名单内如果有对应姓名 → 通过 */
+  const pu=p.toUpperCase();
+  /* 只根据密码反查：白名单内如果有对应姓名 → 通过（R26 起统一用身份证后六位） */
   for(const r of PINYIN_MAP){
-    if(r[3]===p){
+    if((r[5]||'').toUpperCase()===pu){
       if(ROOM_SCORE_NAMES.indexOf(r[1])>=0){
         return {ok:true, name:r[1], pass:p};
       }
@@ -967,6 +1035,27 @@ function cloudStatHtml(){
 }
 function cloudStoreRev(v){cloudRev=v;try{localStorage.setItem('qiwu7_cloud_rev',String(v))}catch(e){}}
 function cloudLoadRev(){try{cloudRev=+(localStorage.getItem('qiwu7_cloud_rev')||0)||0}catch(e){cloudRev=0}}
+/* ===== R26：打开网址即自动连上（补齐线上 r25c 缺失的这段）=====
+   页面如果是从校园网服务器打开的，服务端会把 {url, token} 注入成 window.__QIWU7_CLOUD__。
+   一体机、学生手机没有设置页可填地址口令 → 本地配置为空 → cloudOn() 为 false → 永远不拉取，
+   表现为「电脑上改了，手机上看不到」。老师若手动填过别的地址，以手动为准。 */
+function cloudAutoSetup(){
+  try{
+    const boot=(typeof window!=='undefined')?window.__QIWU7_CLOUD__:null;
+    if(!boot||!boot.url)return false;
+    if(!state.settings)state.settings={};
+    const c=state.settings.cloud||{on:false,url:'',token:''};
+    const manual=!!c.url && String(c.url).replace(/\/+$/,'')!==String(boot.url).replace(/\/+$/,'');
+    if(manual)return false;                       /* 老师自己填了别的服务器 → 不覆盖 */
+    let changed=false;
+    if(c.url!==boot.url){c.url=boot.url;changed=true}
+    if(boot.token&&c.token!==boot.token){c.token=boot.token;changed=true}  /* 服务器改了口令，各端自动跟上 */
+    if(!c.on){c.on=true;changed=true}
+    state.settings.cloud=c;
+    if(changed&&typeof save==='function')save();
+    return changed;
+  }catch(e){return false}
+}
 /* R24：服务器按设备分槽存储 —— 记每个槽的已知版本号，实现增量拉取 */
 function cloudSlotRevs(){try{const m=JSON.parse(localStorage.getItem('qiwu7_slot_revs')||'{}');return (m&&typeof m==='object')?m:{}}catch(e){return{}}}
 function cloudSlotRev(dev){return +cloudSlotRevs()[dev]||0}
@@ -1118,7 +1207,8 @@ function load(){
       if(!state.praiseTomb)state.praiseTomb={}; /* 表扬撤销墓碑：防止同步时被对端复活（R22） */
       migratePraiseR22();                        /* 旧「我要表扬」提名 → 表扬墙 / 自我加分 分流 */
       ['readRecordIds','syncLog'].forEach(k=>{if(!state[k])state[k]=[];});
-      ['growthEdits','pushedGrowth','pushedReport'].forEach(k=>{if(!state[k])state[k]={};});
+      ['growthEdits','pushedGrowth','pushedReport','pushedGrowthTomb','pushedReportTomb'].forEach(k=>{if(!state[k])state[k]={};});
+      migratePushTsR26();                    /* R26：旧存档的 true → 时间戳，并补墓碑字段 */
       if(typeof state.rulesContent!=='string')state.rulesContent=RULES_DEFAULT;
       if(typeof state.rulesUpdatedAt!=='number')state.rulesUpdatedAt=0;
       /* 班级条例结构化版本：旧存档没有 rulesBlocks → 从 RULES_BLOCKS 复制一份作为教师端可编辑的 source of truth */
@@ -2220,7 +2310,7 @@ function bindScore(){
   });
 }
 /* === 撤销守卫（V3）：教师端直接放行；班级端只有登记人本人可撤销 ===
-   授权有效且是本人 → 直接撤；否则弹窗要求输入登记人本人的密码（7+考勤号） */
+   授权有效且是本人 → 直接撤；否则弹窗要求输入登记人本人的密码（身份证后六位） */
 function guardRoomUndo(opName,fn){
   if(!isClassroom()){fn();return}
   if(!opName||ROOM_SCORE_NAMES.indexOf(opName)<0){
@@ -2236,7 +2326,7 @@ function openRoomUndoAuthModal(opName,fn){
   openModal(`<h3><span>🔐 撤销需验证登记人身份</span><button class="close">X</button></h3>
     <div class="callout" style="line-height:1.7">
       这条记录由 <b>${esc(opName)}</b> 登记，按规则只有 TA 本人才有撤销权。<br>
-      请输入 <b>${esc(opName)}</b> 的密码（7 + 两位考勤号）完成验证，验证通过后授权 15 分钟。
+      请输入 <b>${esc(opName)}</b> 的密码（身份证号后六位）完成验证，验证通过后授权 15 分钟。
     </div>
     <div class="field" style="margin-top:14px"><label>请输入 ${esc(opName)} 的密码</label>
       <input id="ru-pass" type="password" placeholder="输入密码" autocomplete="off" autofocus></div>
@@ -4523,10 +4613,10 @@ function viewReport(){
     const sid=currentPersonalSid;
     const name=personalOfSid(sid);
     if(!name)return `<div class="empty">未找到学生信息</div>`;
-    if(!state.pushedReport||!state.pushedReport[sid]){
+    if(!reportPushed(sid)){
       /* 诊断信息：让老师/学生都能看清楚为什么不显示 */
-      const allPushed=state.pushedReport?Object.keys(state.pushedReport).length:0;
-      const stuNames=state.students.filter(s=>state.pushedReport&&state.pushedReport[s.id]).map(s=>s.name);
+      const stuNames=state.students.filter(s=>reportPushed(s.id)).map(s=>s.name);
+      const allPushed=stuNames.length;
       return `<div class="card"><h3><span>📊 我的成绩分析报告</span></h3>
         <div class="empty">⏳ 教师暂未推送你的成绩报告，请耐心等待。</div>
         <div class="callout" style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.7">
@@ -4548,15 +4638,17 @@ function viewReport(){
   const people=gradePeople().filter(n=>state.students.some(s=>s.name===n)||state.exams.some(e=>e.scores[n]));
   const total=people.length;
   const customized=Object.keys(state.reportComments||{}).length;
-  const pushedCnt=state.pushedReport?Object.keys(state.pushedReport).length:0;
+  const pushedCnt=state.students.filter(s=>reportPushed(s.id)).length;
   let html=`<div class="card"><h3><span>个人成绩分析报告</span>
     <span class="row">
       <button class="btn green" id="rp-print-all">📄 一键下载全班为 PDF</button>
       <button class="btn ghost" id="rp-print-rank">下载分班年级前 ${state.groupCount*6||30} 名</button>
       <button class="btn" id="rp-push-all">📤 一键推送给个人端${pushedCnt?`（已推 ${pushedCnt}）`:''}</button>
+      <button class="btn ghost" id="rp-unpush-all" ${pushedCnt?'':'disabled'}>↩ 一键撤回${pushedCnt?`（${pushedCnt} 人）`:''}</button>
     </span></h3>
     <div class="muted">教师端可逐份「预览」、修改寄语，最后用「📤 一键推送给个人端」全量推送；个人端登录后只能看到被推送的报告（隐私保护）。<br>
-    「📄 一键下载全班为 PDF」走打印对话框（另存为 PDF）；「📤 一键推送给个人端」只把数据推到在线个人端，不用导出文件。</div>
+    「📄 一键下载全班为 PDF」走打印对话框（另存为 PDF）；「📤 一键推送给个人端」只把数据推到在线个人端，不用导出文件。<br>
+    <b>↩ 一键撤回</b>（R26）：推送后想收回就点它，撤回后学生个人端立刻看不到成绩报告；需要时再推一次即可恢复。</div>
   </div>`;
   if(!state.exams.length){
     html+=`<div class="card"><div class="empty">暂无考试数据，请先到「成绩分析」导入</div></div>`;
@@ -4576,11 +4668,12 @@ function viewReport(){
   });
   html+=`<div class="card"><h3><span>报告名单（共 ${total} 人 · ${customized?'已自定义寄语 '+customized+' 人':''}）</span>
     <span class="row"><input id="rp-search" placeholder="搜索姓名" style="width:140px"></span></h3>
-    <table><tr><th>序号</th><th>姓名</th><th>组</th><th>职位</th><th>总分</th><th>班排</th><th>级排</th><th>操作</th></tr>
+    <table><tr><th>序号</th><th>姓名</th><th>组</th><th>职位</th><th>总分</th><th>班排</th><th>级排</th><th>推送状态</th><th>操作</th></tr>
     <tbody id="rp-tbody">`;
   rows.forEach((r,i)=>{
     const stu=r.stu;
     const custom=state.reportComments&&state.reportComments[r.nm];
+    const isP=stu?reportPushed(stu.id):false;
     html+=`<tr data-nm="${esc(r.nm)}">
       <td>${i+1}</td>
       <td style="font-weight:600">${esc(r.nm)}${!stu?'<span class="tag n" style="margin-left:4px">转班</span>':''}${custom?'<span class="tag g" style="margin-left:4px">寄语已改</span>':''}</td>
@@ -4589,9 +4682,12 @@ function viewReport(){
       <td style="font-weight:700">${Number.isFinite(r.total)?r.total:'-'}</td>
       <td>${r.tr!=null?r.tr:'-'}</td>
       <td>${r.gr!=null?r.gr:'-'}</td>
+      <td>${stu?(isP?'<span class="tag g">已推送</span>':'<span class="tag n">未推送</span>'):'-'}</td>
       <td style="white-space:nowrap">
         <button class="btn sm" data-rp-preview="${esc(r.nm)}">预览</button>
         <button class="btn ghost sm" data-rp-reset="${esc(r.nm)}" ${custom?'':'disabled'}>重置寄语</button>
+        ${stu&&isP?`<button class="btn ghost sm" data-rp-withdraw="${esc(stu.id)}">↩ 撤回</button>`:''}
+        ${stu&&!isP?`<button class="btn ghost sm" data-rp-push="${esc(stu.id)}">📤 推送</button>`:''}
       </td>
     </tr>`;
   });
@@ -4628,13 +4724,36 @@ function bindReport(){
     /* 推送所有"当前在册"学生（按姓名） */
     const names=state.students.map(s=>s.name);
     confirmDo(`一键推送给全部 ${names.length} 名学生的个人端？\n\n个人端登录后只能看到被推送的报告。`,()=>{
-      state.pushedReport=state.pushedReport||{};
       names.forEach(nm=>{
         const stu=state.students.find(s=>s.name===nm);
-        if(stu)state.pushedReport[stu.id]=true;
+        if(stu)pushReport(stu.id);
       });
       save();render();toast('✅ 已推送给全部 '+names.length+' 人');
     });
+  });
+  /* R26：一键撤回（成绩报告）—— 撤回后个人端立即看不到 */
+  if(isTeacher())$('#rp-unpush-all')&&($('#rp-unpush-all').onclick=()=>{
+    const ids=state.students.filter(s=>reportPushed(s.id)).map(s=>s.id);
+    if(!ids.length)return toast('当前没有已推送的成绩报告');
+    confirmDo(`撤回全部 ${ids.length} 人的成绩报告？\n\n撤回后学生个人端立即看不到（可随时再推送恢复）。`,()=>{
+      ids.forEach(id=>withdrawReport(id));
+      save();render();toast('✅ 已撤回 '+ids.length+' 人的成绩报告');
+    });
+  });
+  /* R26：单个推送 / 撤回 */
+  document.querySelectorAll('[data-rp-withdraw]').forEach(b=>b.onclick=()=>{
+    const sid=b.dataset.rpWithdraw;
+    const stu=state.students.find(s=>s.id===sid);
+    confirmModal('撤回成绩报告','确认撤回「'+(stu?stu.name:'该生')+'」的成绩报告？撤回后 TA 的个人端立即看不到。',()=>{
+      withdrawReport(sid);save();render();toast('✅ 已撤回');
+    });
+  });
+  document.querySelectorAll('[data-rp-push]').forEach(b=>b.onclick=()=>{
+    const sid=b.dataset.rpPush;
+    const stu=state.students.find(s=>s.id===sid);
+    if(!stu)return;
+    if(!state.exams.length)return toast('无考试数据');
+    pushReport(sid);save();render();toast('✅ 已推送 '+stu.name);
   });
   $('#rp-search')&&($('#rp-search').oninput=e=>{
     const kw=e.target.value.trim();
@@ -5494,10 +5613,162 @@ function bindRules(){
     }
   };
 }
-/* 教师端条例编辑器：以 JSON 形式编辑段落树（图片块用 src:'__BUILTIN_RULES_IMAGE__' 占位）
-   保存后写 state.rulesBlocks → 三端通过 master 分区同步 */
+/* ===== R26：可视化条例编辑器（教师端默认入口）=====
+   老师以前看到的是 JSON 源码，对无编程背景的人极不友好。
+   现在改成一条一条可直接改的文字：改文字 / 换类型 / 上下移动 / 复制 / 删除 / 新增。 */
+var rulesDraft=null;                 /* 编辑中的临时副本（点保存才写回 state） */
+function rulesTypeName(t){
+  return t==='title'?'📕 总标题':(t==='h1'?'🔵 大节标题':(t==='h2'?'🟣 小节标题':
+        (t==='note'?'🟡 黄色提示':(t==='image'?'🖼 图片':'⚫ 正文内容'))));
+}
 function openRulesEditor(){
-  const blocks=_rulesBlocks();
+  rulesDraft=JSON.parse(JSON.stringify(_rulesBlocks()));
+  rulesRenderEditor();
+}
+/* 把界面上各输入框的当前值写回 draft —— DOM 是输入过程中的唯一实时来源 */
+function rulesCollect(){
+  const d=rulesDraft||[];
+  document.querySelectorAll('.rules-ed-text').forEach(el=>{
+    const i=+el.getAttribute('data-ri'); if(d[i])d[i].text=el.value;
+  });
+  document.querySelectorAll('.rules-ed-cap').forEach(el=>{
+    const i=+el.getAttribute('data-ri'); if(d[i])d[i].caption=el.value;
+  });
+  return d;
+}
+/* skipCollect=true：直接用已有 draft 渲染（增删改序之后必须这样，
+   否则会从「还没重绘的旧 DOM」把旧值读回来，把刚做的改动覆盖掉） */
+function rulesRenderEditor(skipCollect){
+  const d=skipCollect?(rulesDraft||[]):rulesCollect();
+  const types=['title','h1','h2','p','note','image'];
+  const rows=d.map((b,i)=>{
+    const isImg=b.type==='image';
+    const sel=`<select class="rules-ed-type" data-ri="${i}" style="font-size:13px;padding:4px 6px;border-radius:6px">`
+      +types.map(t=>`<option value="${t}" ${b.type===t?'selected':''}>${rulesTypeName(t)}</option>`).join('')+`</select>`;
+    const ops=`<span style="display:flex;gap:4px">`
+      +`<button class="btn ghost sm" type="button" data-ract="up" data-ri="${i}" ${i===0?'disabled':''} title="上移">⬆</button>`
+      +`<button class="btn ghost sm" type="button" data-ract="down" data-ri="${i}" ${i===d.length-1?'disabled':''} title="下移">⬇</button>`
+      +`<button class="btn ghost sm" type="button" data-ract="dup" data-ri="${i}" title="复制一条">⧉</button>`
+      +`<button class="btn ghost sm" type="button" data-ract="del" data-ri="${i}" title="删除">🗑</button></span>`;
+    const body=isImg
+      ? `<div style="font-size:12px;color:var(--gray-500);margin-top:6px">🖼 内置图片《每日教室卫生检查表》（固定，不需要改）</div>`
+        +`<input class="rules-ed-cap" data-ri="${i}" value="${esc(b.caption||'')}" placeholder="图片下方的说明文字（可留空）" style="width:100%;margin-top:4px">`
+      : `<textarea class="rules-ed-text" data-ri="${i}" rows="${(b.type==='p'||b.type==='note')?2:1}" style="width:100%;margin-top:6px;font-size:14px" placeholder="${(b.type==='p'||b.type==='note')?'这一条的内容…':'标题文字…'}">${esc(b.text||'')}</textarea>`;
+    return `<div style="border:1px solid var(--gray-200);border-radius:10px;padding:10px 12px;margin-bottom:10px;background:#fff">
+      <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+        <span style="display:flex;gap:6px;align-items:center">${sel}<span class="tag n">第 ${i+1} 条</span></span>${ops}</div>${body}</div>`;
+  }).join('');
+  openModal(`<h3><span>✏️ 编辑班级管理条例</span><button class="close">X</button></h3>
+    <div class="help" style="line-height:1.8">直接在下面的框里改文字就行，<b>不用碰任何代码</b>。
+      想把某条换成「大节 / 小节 / 正文 / 黄色提示」，用每条左上角的下拉框切换。<br>
+      改完点最下面的「💾 保存并同步」，班级端和个人端立刻看到新版本。</div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:10px 0">
+      <b style="font-size:13px">➕ 在末尾添加：</b>
+      <button class="btn ghost sm" type="button" data-add="h1">🔵 大节标题</button>
+      <button class="btn ghost sm" type="button" data-add="h2">🟣 小节标题</button>
+      <button class="btn ghost sm" type="button" data-add="p">⚫ 正文内容</button>
+      <button class="btn ghost sm" type="button" data-add="note">🟡 黄色提示</button>
+    </div>
+    <div id="rules-ed-list" style="max-height:54vh;overflow:auto;padding-right:4px">${rows||'<div class="empty">还没有内容，点上面的按钮添加</div>'}</div>
+    <div class="row" style="justify-content:flex-end;margin-top:12px;gap:8px;flex-wrap:wrap">
+      <button class="btn ghost sm" type="button" id="rules-preview">👁 预览效果</button>
+      <button class="btn ghost sm" type="button" id="rules-reset2">↩️ 恢复默认</button>
+      <button class="btn red sm" type="button" id="rules-cancel2">取消</button>
+      <button class="btn green sm" type="button" id="rules-save2">💾 保存并同步</button>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:8px">要一次性大改（比如从别处整份复制过来）？
+      <a href="javascript:;" id="rules-code-mode" style="color:var(--primary)">切换到代码模式（高级）</a></div>`);
+
+  /* 文字输入：实时写回 draft，不重渲染 → 不会失焦、不会打断打字 */
+  document.querySelectorAll('.rules-ed-text').forEach(el=>{
+    el.oninput=()=>{const i=+el.getAttribute('data-ri');if(rulesDraft[i])rulesDraft[i].text=el.value};
+  });
+  document.querySelectorAll('.rules-ed-cap').forEach(el=>{
+    el.oninput=()=>{const i=+el.getAttribute('data-ri');if(rulesDraft[i])rulesDraft[i].caption=el.value};
+  });
+  /* 换类型：image 与文本块的字段要互相转换 */
+  document.querySelectorAll('.rules-ed-type').forEach(el=>{
+    el.onchange=()=>{
+      const i=+el.getAttribute('data-ri'),b=rulesDraft[i]; if(!b)return;
+      const t=el.value; rulesCollect();
+      if(t==='image'){b.src=b.src||'__BUILTIN_RULES_IMAGE__';b.caption=b.text||'';delete b.text}
+      else if(b.type==='image'){b.text=b.caption||'';delete b.caption;delete b.src}
+      b.type=t; rulesRenderEditor(true);
+    };
+  });
+  document.querySelectorAll('[data-ract]').forEach(el=>{
+    el.onclick=()=>{
+      const i=+el.getAttribute('data-ri'),act=el.getAttribute('data-ract');
+      rulesCollect(); const d=rulesDraft;
+      if(act==='up'&&i>0){const t=d[i];d[i]=d[i-1];d[i-1]=t}
+      else if(act==='down'&&i<d.length-1){const t=d[i];d[i]=d[i+1];d[i+1]=t}
+      else if(act==='dup'){d.splice(i+1,0,JSON.parse(JSON.stringify(d[i])))}
+      else if(act==='del'){
+        if(d.length<=1){alertModal('不能删','至少要保留一条内容。');return}
+        d.splice(i,1);
+      }
+      rulesRenderEditor(true);
+    };
+  });
+  document.querySelectorAll('[data-add]').forEach(el=>{
+    el.onclick=()=>{
+      rulesCollect();
+      const t=el.getAttribute('data-add');
+      rulesDraft.push(t==='image'?{type:'image',src:'__BUILTIN_RULES_IMAGE__',caption:''}:{type:t,text:''});
+      rulesRenderEditor(true);
+      const box=document.getElementById('rules-ed-list');
+      if(box)box.scrollTop=box.scrollHeight;
+    };
+  });
+  const pv=$('#rules-preview');
+  if(pv)pv.onclick=()=>{
+    rulesCollect();
+    const old=state.rulesBlocks;
+    state.rulesBlocks=rulesDraft;      /* 临时替换渲染，渲染完立刻还原，不落盘 */
+    let html='';
+    try{html=viewRulesPretty()}catch(e){html='<div class="empty">预览失败：'+esc(e.message)+'</div>'}
+    state.rulesBlocks=old;
+    openModal(`<h3><span>👁 预览效果（学生看到的样子）</span><button class="close">X</button></h3>
+      <div style="max-height:70vh;overflow:auto">${html}</div>
+      <div class="row" style="justify-content:flex-end;margin-top:12px">
+        <button class="btn green sm" type="button" id="rules-preview-back">← 返回继续编辑</button></div>`);
+    const bk=$('#rules-preview-back'); if(bk)bk.onclick=()=>rulesRenderEditor(true);
+  };
+  const rs=$('#rules-reset2');
+  if(rs)rs.onclick=()=>{
+    confirmModal('恢复默认','确定恢复成系统默认的 V1.1 版本吗？你之前的所有修改会被覆盖。',()=>{
+      rulesDraft=JSON.parse(JSON.stringify(RULES_BLOCKS));
+      state.rulesBlocks=JSON.parse(JSON.stringify(RULES_BLOCKS));
+      state.rulesUpdatedAt=Date.now();rulesDraft=null;save();closeModal();render();
+      toast('✅ 已恢复默认版本');
+    });
+  };
+  const cn=$('#rules-cancel2');
+  if(cn)cn.onclick=()=>{rulesDraft=null;closeModal()};
+  const sv=$('#rules-save2');
+  if(sv)sv.onclick=()=>{
+    const d=rulesCollect(),bad=[];
+    const clean=d.filter((b,i)=>{
+      if(b.type==='image')return true;
+      if(!String(b.text||'').trim()){bad.push(i+1);return false}
+      return true;
+    });
+    if(!clean.length){alertModal('没有内容','至少要有一条非空内容才能保存。');return}
+    confirmModal('保存并同步到三端','确定保存吗？'+(bad.length?('（第 '+bad.join('、')+' 条是空的，会自动跳过）'):''),()=>{
+      state.rulesBlocks=clean;
+      state.rulesUpdatedAt=Date.now();
+      rulesDraft=null;
+      save();closeModal();render();
+      toast('✅ 条例已保存，班级端/个人端会同步更新');
+    });
+  };
+  const cm=$('#rules-code-mode');
+  if(cm)cm.onclick=()=>{rulesCollect();openRulesEditorJson()};
+}
+
+/* 代码模式（高级）：JSON 段落树 —— 一般老师用不到，保留作兜底入口 */
+function openRulesEditorJson(){
+  const blocks=(rulesDraft&&rulesDraft.length)?rulesDraft:_rulesBlocks();
   const help='每条 block 支持类型：<br>'
     +'&nbsp;&nbsp;<b>title</b>：<code>{"type":"title","text":"标题"}</code><br>'
     +'&nbsp;&nbsp;<b>h1</b>：<code>{"type":"h1","text":"大节标题"}</code>（编号会自动加圆点 1~6）<br>'
@@ -5640,9 +5911,11 @@ function viewGrowth(){
         <input type="date" id="gr-from" value="${todayStr()}"><span>~</span>
         <input type="date" id="gr-to" value="${todayStr()}">
         <button class="btn" id="gr-gen">📊 生成全班预览</button>
+        <button class="btn ghost" id="gr-unpush-all">↩ 一键撤回成长报告</button>
         <button class="btn green" id="gr-print-all" title="将全班成长报告合并导出为 A4 PDF（走浏览器打印对话框另存为 PDF）">📄 一键下载全班为 PDF</button>
       </span></h3>
-      <div class="muted">无需逐个名字点 —— 选择起止日期 → 一键生成全班 47 份成长报告 → 班主任可勾选要推送的学生，或点「编辑寄语」单独润色 → 最后「📤 推送已选」。</div>
+      <div class="muted">无需逐个名字点 —— 选择起止日期 → 一键生成全班 47 份成长报告 → 班主任可勾选要推送的学生，或点「编辑寄语」单独润色 → 最后「📤 推送已选」。<br>
+      <b>↩ 一键撤回成长报告</b>（R26）：撤回后学生个人端立刻看不到成长报告；需要时重新推送即可恢复。</div>
       <div class="muted" style="font-size:12px">💡 「📄 一键下载全班为 PDF」会按当前日期区间的系统生成版（含已编辑过的）合并导出；如需导出最新文案，请先点「📊 生成全班预览」刷新。</div>
       <div id="gr-preview-all" style="margin-top:14px"></div>
     </div>`;
@@ -5650,7 +5923,7 @@ function viewGrowth(){
   if(isPersonal()){
     const sid=currentPersonalSid;
     const name=personalOfSid(sid);
-    if(state.pushedGrowth&&state.pushedGrowth[sid]){
+    if(growthPushed(sid)){
       const stuObj=state.students.find(s=>s.id===sid);
       return `<div class="card"><h3><span>📈 ${esc(name||'')} · 我的成长报告（教师已推送 ✓）</span>
         <span class="muted">寄语由老师推送；成绩概览实时同步</span></h3>
@@ -5659,14 +5932,14 @@ function viewGrowth(){
       ${stuObj?growthScoreHtml(stuObj):''}`;
     }
     /* 诊断信息 */
-    const allPushed=state.pushedGrowth?Object.keys(state.pushedGrowth).length:0;
-    const stuNames=state.students.filter(s=>state.pushedGrowth&&state.pushedGrowth[s.id]).map(s=>s.name);
+    const stuNames2=state.students.filter(s=>growthPushed(s.id)).map(s=>s.name);
+    const allPushed=stuNames2.length;
     return `<div class="card"><h3><span>📈 我的成长报告</span></h3>
       <div class="empty">⏳ 教师暂未推送我的成长报告，请耐心等待。</div>
       <div class="callout" style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.7">
         📋 当前会话诊断<br>
         · 我（个人端）：<b>${esc(name||'?')}</b> · sid=<code>${esc(sid)}</code><br>
-        · 教师端已推送成长报告：<b>${allPushed}</b>${stuNames.length?'（含 '+esc(stuNames.slice(0,3).join('、'))+(stuNames.length>3?' 等':'')+'）':''}<br>
+        · 教师端已推送成长报告：<b>${allPushed}</b>${stuNames2.length?'（含 '+esc(stuNames2.slice(0,3).join('、'))+(stuNames2.length>3?' 等':'')+'）':''}<br>
         ${!allPushed?'<span style="color:var(--red)">⚠️ 教师端还没点过「📊 生成全班预览」→「📤 推送已选」。</span>':'<span style="color:var(--red)">⚠️ 教师端推过别人但没推你；切回教师端勾选你后再推一次。</span>'}
       </div>
     </div>`;
@@ -5705,12 +5978,12 @@ function bindGrowth(){
       <table style="font-size:13px"><tr><th>✓</th><th>姓名</th><th>组</th><th>状态</th><th>操作</th></tr><tbody>`;
     stus.forEach(s=>{
       const sid=s.id;
-      const pushed=state.pushedGrowth&&state.pushedGrowth[sid];
+      const pushed=growthPushed(sid);
       headHtml+=`<tr><td><input type="checkbox" class="gr-cb" value="${esc(sid)}" ${pushed?'checked':''}></td>
         <td><b>${esc(s.name)}</b></td>
         <td>${groupName(s.group)}</td>
         <td>${pushed?'<span class="tag g">已推送</span>':'<span class="tag n">未推送</span>'}</td>
-        <td><button class="btn sm" data-gr-preview="${esc(sid)}">编辑寄语</button></td></tr>`;
+        <td style="white-space:nowrap"><button class="btn sm" data-gr-preview="${esc(sid)}">编辑寄语</button>${pushed?`<button class="btn ghost sm" data-gr-withdraw="${esc(sid)}">↩ 撤回</button>`:''}</td></tr>`;
     });
     headHtml+=`</tbody></table></div>`;
     /* 每份报告独立 textarea（默认自动填系统生成版） */
@@ -5745,7 +6018,7 @@ function bindGrowth(){
           const ta=document.querySelector('textarea.gr-ta[data-sid="'+sid+'"]');
           if(!ta)return;
           state.growthEdits[sid]=ta.value;
-          state.pushedGrowth[sid]=true;
+          pushGrowth(sid);
         });
         save();render();
         toast('✅ 已推送 '+cbs.length+' 份成长报告');
@@ -5758,12 +6031,29 @@ function bindGrowth(){
         stus.forEach(s=>{
           const ta=document.querySelector('textarea.gr-ta[data-sid="'+s.id+'"]');
           if(ta){state.growthEdits[s.id]=ta.value;}
-          state.pushedGrowth[s.id]=true;
+          pushGrowth(s.id);
         });
         save();render();
         toast('✅ 已推送给全部 '+cnt+' 人');
       });
     };
+    /* R26：一键撤回 / 单个撤回（成长报告） */
+    const btnUnpushAll=$('#gr-unpush-all');
+    if(btnUnpushAll)btnUnpushAll.onclick=()=>{
+      const ids=state.students.filter(s=>growthPushed(s.id)).map(s=>s.id);
+      if(!ids.length)return toast('当前没有已推送的成长报告');
+      confirmDo(`撤回全部 ${ids.length} 人的成长报告？\n\n撤回后学生个人端立即看不到（可随时再推送恢复）。`,()=>{
+        ids.forEach(id=>withdrawGrowth(id));
+        save();render();toast('✅ 已撤回 '+ids.length+' 人的成长报告');
+      });
+    };
+    document.querySelectorAll('[data-gr-withdraw]').forEach(b=>b.onclick=()=>{
+      const sid=b.dataset.grWithdraw;
+      const stu=state.students.find(s=>s.id===sid);
+      confirmModal('撤回成长报告','确认撤回「'+(stu?stu.name:'该生')+'」的成长报告？撤回后 TA 的个人端立即看不到。',()=>{
+        withdrawGrowth(sid);save();render();toast('✅ 已撤回');
+      });
+    });
     document.querySelectorAll('[data-gr-preview]').forEach(b=>b.onclick=()=>{
       const sid=b.dataset.grPreview;
       const stu=state.students.find(x=>x.id===sid);
@@ -7058,7 +7348,9 @@ function buildPayload(){
       reportComments:state.reportComments,
       /* R25c：这些字段早就该随 master 走，但一直没进同步包（班级条例改了不同步的根因） */
       rulesContent:state.rulesContent,rulesBlocks:state.rulesBlocks,rulesUpdatedAt:state.rulesUpdatedAt,
-      growthEdits:state.growthEdits,pushedGrowth:state.pushedGrowth,pushedReport:state.pushedReport
+      growthEdits:state.growthEdits,pushedGrowth:state.pushedGrowth,pushedReport:state.pushedReport,
+      /* R26：撤回墓碑必须一起同步，否则教师端撤回后其他设备仍显示已推送 */
+      pushedGrowthTomb:state.pushedGrowthTomb,pushedReportTomb:state.pushedReportTomb
     };
   }
   return p;
@@ -7084,8 +7376,11 @@ function applyMaster(m){
     state.rulesUpdatedAt=m.rulesUpdatedAt;
   }
   if(m.growthEdits)state.growthEdits=Object.assign({},state.growthEdits,m.growthEdits);
-  if(m.pushedGrowth)state.pushedGrowth=Object.assign({},state.pushedGrowth,m.pushedGrowth);
-  if(m.pushedReport)state.pushedReport=Object.assign({},state.pushedReport,m.pushedReport);
+  /* R26：推送 / 撤回时间戳各自取最大值（撤回不会被对端的旧推送覆盖） */
+  state.pushedGrowth=state.pushedGrowth||{}; state.pushedGrowthTomb=state.pushedGrowthTomb||{};
+  state.pushedReport=state.pushedReport||{}; state.pushedReportTomb=state.pushedReportTomb||{};
+  mergePushField(state.pushedGrowth,state.pushedGrowthTomb,m.pushedGrowth,m.pushedGrowthTomb);
+  mergePushField(state.pushedReport,state.pushedReportTomb,m.pushedReport,m.pushedReportTomb);
   return true;
 }
 /* ---------- 合并（只增不覆盖，返回撤销所需信息） ---------- */
@@ -7564,6 +7859,9 @@ currentRole=loadRole();
 
 /* ===== R23/R24：校园网云同步启动（没开就完全不做事，与离线版体验一致） ===== */
 cloudLoadRev();
+/* R26：把本地 r24 的「打开网址即自动连上」补回来 —— 线上 r25c 缺了这段，
+   导致个人端（学生手机）/ 班级端（一体机）没有设置页可填地址口令，永远同步不了。 */
+cloudAutoSetup();
 /* R24：关页面 / 切后台瞬间把本机数据推送到服务器，避免「改完就关」丢同步 */
 window.addEventListener('pagehide',cloudFlushExit);
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')cloudFlushExit()});
