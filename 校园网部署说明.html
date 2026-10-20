@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width,initial-scale=1" name="viewport"/>
+<title>栖梧7班 · 校园网部署说明（给 IT 老师）</title>
+<style>
+  :root{--primary:#4f46e5;--primary-soft:#eef2ff;--green:#16a34a;--red:#dc2626;--amber:#d97706;
+        --gray-200:#e5e7eb;--gray-500:#6b7280;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+       font-size:15px;line-height:1.8;color:#1f2937;background:#f9fafb;}
+  header{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:28px 20px}
+  header .inner{max-width:900px;margin:0 auto}
+  header h1{margin:0;font-size:24px}
+  header .sub{margin-top:6px;opacity:.9;font-size:14px}
+  .wrap{max-width:900px;margin:0 auto;padding:20px 20px 60px}
+  .card{background:#fff;border:1px solid var(--gray-200);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+  .card h2{margin:0 0 10px;font-size:18px;border-left:4px solid var(--primary);padding-left:10px}
+  .card h3{margin:16px 0 6px;font-size:15px;color:var(--primary)}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:14px}
+  th,td{border:1px solid var(--gray-200);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#f3f4f6;font-weight:700}
+  code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-family:Consolas,Monaco,monospace;font-size:13px}
+  pre{background:#1f2937;color:#e5e7eb;padding:12px 14px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.6}
+  pre code{background:none;color:inherit;padding:0}
+  .callout{border:1.5px solid #93c5fd;background:#dbeafe;color:#1e40af;padding:10px 14px;border-radius:8px;margin:10px 0}
+  .warn{border-color:var(--amber);background:#fffbeb;color:#92400e}
+  .ok{border-color:#86efac;background:#f0fdf4;color:#166534}
+  .step{display:flex;gap:12px;margin:14px 0}
+  .step .n{flex:0 0 30px;height:30px;border-radius:50%;background:var(--primary);color:#fff;
+           display:flex;align-items:center;justify-content:center;font-weight:800}
+  .step .b{flex:1}
+  ol,ul{margin:6px 0;padding-left:22px}
+  .muted{color:var(--gray-500);font-size:13px}
+  footer{text-align:center;color:var(--gray-500);font-size:13px;padding:20px}
+  @media print{header{background:#4f46e5!important;-webkit-print-color-adjust:exact}}
+</style>
+</head>
+<body>
+<header>
+<div class="inner">
+<h1>🐖 栖梧7班班级管理系统 · 校园网部署说明</h1>
+<div class="sub">给帮忙部署的 IT 老师 · 10 分钟搞定 · 零第三方依赖 · 数据全在校内</div>
+</div>
+</header>
+<div class="wrap">
+<div class="card" style="border-color:var(--amber)">
+<h2 style="border-left-color:var(--amber)">⚠ 如果钉钉 / 微信 / 邮箱提示「有病毒或恶意软件」</h2>
+<div class="callout warn">
+<b>这是误报，不是病毒。</b>这个同步服务要做的事情就是：<b>在这台电脑上开一个端口，让校园网里的其他电脑连过来读写一个 JSON 文件</b>。<br/>
+      这个行为特征，和杀毒软件规则库里的「远控 / 后门」几乎一模一样 —— 所以 <code>.bat</code>、<code>.py</code>、<code>.js</code>
+      这几类脚本附件<b>几乎必然会被拦截</b>，跟代码本身干不干净没关系。
+    </div>
+<div class="callout">
+<b>绕过办法：不传脚本文件。</b>服务端的完整源码就印在下面（全文公开可读，<b>没有任何联网上传、没有隐藏行为</b>），
+      在目标电脑上「复制 → 记事本粘贴 → 另存为」即可，30 秒搞定。
+    </div>
+<h3>方案 A · Python 版（推荐）</h3>
+<p>① 点下面的按钮复制　② 目标电脑打开<b>记事本</b>粘贴　③ 另存为 <code>qiwu7_server.py</code>
+    （保存时「编码」选 <b>UTF-8</b>，文件名一定要带 <code>.py</code>，不能是 <code>.py.txt</code>）</p>
+<p><button class="cbtn" onclick="copySrc('src-py')" type="button">📋 复制 Python 服务端源码</button>
+<span id="tip-py" style="margin-left:10px;font-weight:700;color:var(--green)"></span></p>
+<details><summary>展开查看源码全文（331 行，可自行核对）</summary>
+<pre><code id="src-py">#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+栖梧7班班级管理系统 · 校园网同步服务端（Python 版 · R24 每设备数据槽）
+
+零第三方依赖：只用 Python 标准库。Windows / Linux / macOS 通用。
+Python 3.6+ 即可（Windows 上装 Python 时记得勾选 "Add Python to PATH"）。
+
+做什么：
+  1) 托管主程序网页（浏览器打开 http://服务器IP:端口 就能用）
+  2) 提供 /api/sync 接口，把每个设备的数据存成独立「数据槽」
+     —— 教师端 / 班级端 / 个人端各写各的槽，读的时候把所有槽合并，
+       任何一台设备都不可能覆盖别人刚写的数据（R24 之前是整包替换，
+       学生端一同步就可能把教师端推的名单/成绩冲掉，现已根治）
+
+数据文件：本脚本同目录 qiwu7_data/data.json（自动创建，自动留 10 份历史备份）
+"""
+import json, os, sys, time, shutil, threading
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote
+
+# ============ 配置 ============
+PORT = int(sys.argv[1]) if len(sys.argv) &gt; 1 else int(os.environ.get('QIWU7_PORT', '8080'))
+TOKEN = os.environ.get('QIWU7_TOKEN', 'qiwu7')      # 班级口令，务必改成自己的
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'qiwu7_data')
+DATA_FILE = os.path.join(DATA_DIR, 'data.json')
+BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
+MAX_BACKUPS = 10
+SLOT_IDLE_PRUNE_MS = 180 * 24 * 3600 * 1000   # 数据槽闲置超过 180 天才允许清理（避免暑假误删）
+LOCK = threading.Lock()
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def log(msg):
+    print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
+
+
+def empty_slots():
+    return {'rev': 0, 'ts': 0, 'slots': {}}
+
+
+def migrate(d):
+    """旧版（整包 payload）数据文件 → 每设备数据槽结构；迁移是幂等的"""
+    if not isinstance(d, dict):
+        return empty_slots()
+    if isinstance(d.get('slots'), dict):
+        d.setdefault('rev', 0)
+        d.setdefault('ts', 0)
+        return d
+    if d.get('payload') is not None:
+        # R23 及更早的整包存档：包成名为 legacy 的槽，新客户端合并时会自然吸收
+        ts = d.get('ts') or int(time.time() * 1000)
+        return {'rev': d.get('rev', 0), 'ts': ts,
+                'slots': {'legacy': {'rev': d.get('rev', 0), 'ts': ts, 'payload': d['payload']}}}
+    return empty_slots()
+
+
+def read_data():
+    """读取服务器上的数据；没有就返回空包（rev=0）。旧格式自动迁移。"""
+    if not os.path.exists(DATA_FILE):
+        return empty_slots()
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return migrate(d)
+    except Exception as e:
+        log('数据文件损坏：%s —— 自动回退到最近一份备份' % e)
+        restore_latest_backup()
+        return empty_slots()
+
+
+def backup_current():
+    """写入前把现有文件复制一份到 backups/，只保留最近 MAX_BACKUPS 份"""
+    if not os.path.exists(DATA_FILE):
+        return
+    name = 'data-%s.json' % time.strftime('%Y%m%d-%H%M%S')
+    try:
+        shutil.copy2(DATA_FILE, os.path.join(BACKUP_DIR, name))
+    except Exception as e:
+        log('备份失败：%s' % e)
+        return
+    try:
+        bks = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith('data-')])
+        while len(bks) &gt; MAX_BACKUPS:
+            os.remove(os.path.join(BACKUP_DIR, bks.pop(0)))
+    except Exception:
+        pass
+
+
+def restore_latest_backup():
+    try:
+        bks = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith('data-')])
+        if not bks:
+            return False
+        shutil.copy2(os.path.join(BACKUP_DIR, bks[-1]), DATA_FILE)
+        log('已恢复备份：%s' % bks[-1])
+        return True
+    except Exception:
+        return False
+
+
+def write_file(d):
+    """原子落盘：先写临时文件再替换，断电也不会写坏"""
+    backup_current()
+    d['ts'] = int(time.time() * 1000)
+    tmp = DATA_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, DATA_FILE)
+
+
+def prune_slots(d, keep_dev=None):
+    """清理闲置超过 180 天的数据槽（刚写入的槽除外；只剩一个槽时不清）"""
+    now = int(time.time() * 1000)
+    slots = d.get('slots') or {}
+    stale = [dev for dev, s in slots.items()
+             if dev != keep_dev and now - (s.get('ts') or 0) &gt; SLOT_IDLE_PRUNE_MS]
+    if stale and len(slots) - len(stale) &gt;= 1:
+        for dev in stale:
+            del slots[dev]
+        log('已清理 %d 个闲置数据槽：%s' % (len(stale), ', '.join(stale)))
+
+
+def write_slot(payload, dev, base_rev):
+    """
+    写入某个设备自己的数据槽（槽级乐观锁）：
+      - base_rev 与该槽当前 rev 不一致 → 拒绝（409），客户端重新拉取合并后再试
+      - 一致 → 写入，该槽 rev+1，全局 rev+1
+    各设备写各的槽，互相之间永远不会冲突。
+    """
+    with LOCK:
+        d = read_data()
+        slots = d.setdefault('slots', {})
+        cur = slots.get(dev) or {'rev': 0, 'ts': 0, 'payload': None}
+        if base_rev is not None and cur.get('rev', 0) != base_rev:
+            return {'ok': False, 'conflict': True, 'rev': d.get('rev', 0),
+                    'slotRev': cur.get('rev', 0), 'payload': cur.get('payload')}
+        d['rev'] = d.get('rev', 0) + 1
+        slots[dev] = {'rev': d['rev'], 'ts': int(time.time() * 1000), 'payload': payload}
+        prune_slots(d, keep_dev=dev)
+        write_file(d)
+        return {'ok': True, 'rev': d['rev'], 'ts': d['ts'], 'slotRev': slots[dev]['rev']}
+
+
+def write_legacy(payload, base_rev):
+    """兼容 R23 旧客户端：整包替换（保留旧语义，便于混合升级期间过渡）"""
+    with LOCK:
+        d = read_data()
+        if base_rev is not None and d.get('rev', 0) != base_rev:
+            return {'ok': False, 'conflict': True, 'rev': d.get('rev', 0),
+                    'payload': {'slots': d.get('slots')}}
+        d['rev'] = d.get('rev', 0) + 1
+        d['slots'] = {'legacy': {'rev': d['rev'], 'ts': int(time.time() * 1000), 'payload': payload}}
+        write_file(d)
+        return {'ok': True, 'rev': d['rev'], 'ts': d['ts']}
+
+
+class Handler(SimpleHTTPRequestHandler):
+    """静态文件 + 同步接口"""
+
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_token(self, q):
+        return q.get('token', [''])[0] == TOKEN
+
+    def do_OPTIONS(self):
+        self._send_json({'ok': True})
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+
+        if u.path == '/api/ping':
+            return self._send_json({'ok': True, 'name': 'qiwu7', 'rev': read_data()['rev'],
+                                    'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+
+        if u.path == '/api/sync':
+            if not self._check_token(q):
+                return self._send_json({'ok': False, 'error': '口令不对'}, 401)
+            d = read_data()
+            slots = d.get('slots') or {}
+            # 客户端带上各槽已知版本号（revs={设备id:版本}）→ 只回传有变化的槽，省带宽
+            revs = {}
+            raw_revs = q.get('revs', [''])[0]
+            if raw_revs:
+                try:
+                    revs = json.loads(raw_revs)
+                    if not isinstance(revs, dict):
+                        revs = {}
+                except Exception:
+                    revs = {}
+            if revs:
+                changed = {dev: s for dev, s in slots.items()
+                           if not (dev in revs and revs[dev] == s.get('rev'))}
+            else:
+                changed = slots
+            return self._send_json({'ok': True, 'rev': d['rev'], 'ts': d['ts'], 'slots': changed,
+                                    'count': len(slots),
+                                    'slotsRev': {dev: s.get('rev', 0) for dev, s in slots.items()}})
+
+        if u.path == '/api/backup':
+            if not self._check_token(q):
+                return self._send_json({'ok': False, 'error': '口令不对'}, 401)
+            d = read_data()
+            body = json.dumps(d, ensure_ascii=False).encode('utf-8')
+            fn = '栖梧7班数据备份-%s.json' % time.strftime('%Y%m%d-%H%M')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            # HTTP 头只能装 ASCII：中文文件名必须按 RFC 5987 百分号编码，否则 send_header 抛 UnicodeEncodeError
+            self.send_header('Content-Disposition', 'attachment; filename*=UTF-8\'\'%s' % quote(fn))
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 其余走静态文件
+        return SimpleHTTPRequestHandler.do_GET(self)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+
+        if u.path != '/api/sync':
+            return self._send_json({'ok': False, 'error': 'not found'}, 404)
+
+        if not self._check_token(q):
+            return self._send_json({'ok': False, 'error': '口令不对'}, 401)
+
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length).decode('utf-8') if length else ''
+        try:
+            req = json.loads(raw) if raw else {}
+        except Exception as e:
+            return self._send_json({'ok': False, 'error': '请求不是合法 JSON：%s' % e}, 400)
+
+        payload = req.get('payload')
+        base_rev = req.get('baseRev')
+        if payload is None:
+            return self._send_json({'ok': False, 'error': '缺少 payload'}, 400)
+
+        dev = req.get('deviceId')
+        if dev is not None:
+            # R24 新协议：写自己的数据槽
+            dev = str(dev)[:64] or 'unknown'
+            r = write_slot(payload, dev, base_rev)
+        else:
+            # 旧协议：整包替换（兼容升级过渡期的旧客户端）
+            r = write_legacy(payload, base_rev)
+
+        if not r.get('ok'):
+            # 冲突：把服务器最新版本一起返回，客户端合并后重试
+            return self._send_json({'ok': False, 'conflict': True, 'rev': r.get('rev', 0),
+                                    'slotRev': r.get('slotRev'),
+                                    'payload': r.get('payload'),
+                                    'slots': r.get('payload', {}).get('slots') if isinstance(r.get('payload'), dict) else None,
+                                    'error': '数据已被其他设备更新，请合并后重试'}, 409)
+        log('已同步 rev=%s（%s，来自 %s）' % (r['rev'], dev or 'legacy', self.client_address[0]))
+        return self._send_json({'ok': True, 'rev': r['rev'], 'ts': r['ts'], 'slotRev': r.get('slotRev')})
+
+    def log_message(self, fmt, *args):
+        # 只在出错时打印，避免刷屏
+        if '404' in (fmt % args) or '500' in (fmt % args):
+            log(fmt % args)
+
+
+def main():
+    # 静态根目录 = 本脚本所在目录
+    os.chdir(BASE_DIR)
+    try:
+        srv = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+    except OSError as e:
+        print('端口 %s 起不来：%s\n换一个端口试试，例如：python qiwu7_server.py 9000' % (PORT, e))
+        sys.exit(1)
+
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = '127.0.0.1'
+
+    print('=' * 62)
+    print('  栖梧7班班级管理系统 · 校园网服务端已启动（R24 数据槽版）')
+    print('=' * 62)
+    print('  本机访问：   http://127.0.0.1:%s' % PORT)
+    print('  局域网访问： http://%s:%s   ← 把这个地址发给老师 / 输进一体机' % (ip, PORT))
+    print('  班级口令：   %s' % TOKEN)
+    if TOKEN == 'qiwu7':
+        print('  ' + '!' * 58)
+        print('  !! 安全警告：你现在用的是【默认口令 qiwu7】')
+        print('  !! 这个口令是公开的（写在启动脚本和说明文档里），')
+        print('  !! 校园网内任何知道本机地址的人都能下载全班数据、')
+        print('  !! 给自己加分，甚至覆盖全班记录。')
+        print('  !! 强烈建议改掉（改完要重启本服务）：')
+        print('  !!   Windows: 改 启动_Windows.bat 第 13 行 set QIWU7_TOKEN=你的口令')
+        print('  !!   Linux:   QIWU7_TOKEN=你的口令 ./启动_Linux.sh')
+        print('  ' + '!' * 58)
+    print('  数据文件：   %s' % DATA_FILE)
+    print('  停止服务：   按 Ctrl + C（systemd 服务用 sudo systemctl stop qiwu7）')
+    print('=' * 62)
+    print('  提醒：第一次打开网页后，要去「设置 / 数据 → 🌐 校园网同步」')
+    print('        填上面的地址与口令，点「立即同步」，三端就通了。')
+    print('=' * 62)
+    sys.stdout.flush()          # 立刻显示，避免被输出缓冲吞掉
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print('\n已停止。')
+        srv.server_close()
+
+
+if __name__ == '__main__':
+    main()
+</code></pre></details>
+<h3>方案 B · Node 版（备选，只有没装 Python 时才用）</h3>
+<p>同上，另存为 <code>qiwu7_server.js</code>。</p>
+<p><button class="cbtn" onclick="copySrc('src-js')" type="button">📋 复制 Node 服务端源码</button>
+<span id="tip-js" style="margin-left:10px;font-weight:700;color:var(--green)"></span></p>
+<details><summary>展开查看源码全文（247 行）</summary>
+<pre><code id="src-js">#!/usr/bin/env node
+/**
+ * 栖梧7班班级管理系统 · 校园网同步服务端（Node 版 · R24 每设备数据槽）
+ *
+ * 零第三方依赖：只用 Node 自带模块。装了 Node 就能跑（node -v 查看有没有）。
+ * 与 Python 版功能完全一致（R24 分槽存储），二选一即可 —— 推荐优先用 Python 版（更好装）。
+ *
+ * 用法：
+ *   node qiwu7_server.js            // 默认 8080
+ *   node qiwu7_server.js 9000       // 指定端口
+ *   set QIWU7_TOKEN=xxxx &amp;&amp; node qiwu7_server.js    // Windows 设口令
+ *   QIWU7_TOKEN=xxxx node qiwu7_server.js           // Linux 设口令
+ *
+ * 数据文件：本脚本同目录 qiwu7_data/data.json（自动创建，自动留 10 份历史备份）
+ */
+'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = parseInt(process.argv[2], 10) || parseInt(process.env.QIWU7_PORT || '8080', 10);
+const TOKEN = process.env.QIWU7_TOKEN || 'qiwu7';
+const BASE_DIR = __dirname;
+const DATA_DIR = path.join(BASE_DIR, 'qiwu7_data');
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const MAX_BACKUPS = 10;
+const SLOT_IDLE_PRUNE_MS = 180 * 24 * 3600 * 1000;   // 数据槽闲置 180 天才允许清理
+const INDEX = path.join(BASE_DIR, 'index.html');   // 主程序（复制一份改名 index.html')
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+const log = m =&gt; console.log(`[${new Date().toTimeString().slice(0, 8)}] ${m}`);
+
+function emptyData() { return { rev: 0, ts: 0, slots: {} }; }
+
+function migrate(d) {
+  /* 旧版（整包 payload）→ 每设备数据槽；幂等 */
+  if (!d || typeof d !== 'object') return emptyData();
+  if (d.slots &amp;&amp; typeof d.slots === 'object') { d.rev = d.rev || 0; d.ts = d.ts || 0; return d; }
+  if (d.payload !== undefined) {
+    const ts = d.ts || Date.now();
+    return { rev: d.rev || 0, ts, slots: { legacy: { rev: d.rev || 0, ts, payload: d.payload } } };
+  }
+  return emptyData();
+}
+
+function readData() {
+  if (!fs.existsSync(DATA_FILE)) return emptyData();
+  try {
+    return migrate(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
+  } catch (e) {
+    log('数据文件损坏：' + e.message + ' —— 自动回退到最近一份备份');
+    restoreLatest();
+    return emptyData();
+  }
+}
+function backupCurrent() {
+  if (!fs.existsSync(DATA_FILE)) return;
+  try {
+    fs.copyFileSync(DATA_FILE, path.join(BACKUP_DIR, `data-${new Date().toISOString().replace(/[:.]/g, '-')}.json`));
+    const bks = fs.readdirSync(BACKUP_DIR).filter(f =&gt; f.startsWith('data-')).sort();
+    while (bks.length &gt; MAX_BACKUPS) fs.unlinkSync(path.join(BACKUP_DIR, bks.shift()));
+  } catch (e) { log('备份失败：' + e.message); }
+}
+function restoreLatest() {
+  try {
+    const bks = fs.readdirSync(BACKUP_DIR).filter(f =&gt; f.startsWith('data-')).sort();
+    if (!bks.length) return;
+    fs.copyFileSync(path.join(BACKUP_DIR, bks[bks.length - 1]), DATA_FILE);
+    log('已恢复备份：' + bks[bks.length - 1]);
+  } catch (e) { /* ignore */ }
+}
+function writeFile(d) {
+  /* 原子落盘：先写临时文件再替换 */
+  backupCurrent();
+  d.ts = Date.now();
+  const tmp = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(d), 'utf8');
+  fs.renameSync(tmp, DATA_FILE);
+}
+function pruneSlots(d, keepDev) {
+  /* 清理闲置超过 180 天的槽（刚写的除外；只剩一个槽时不清） */
+  const now = Date.now();
+  const slots = d.slots || {};
+  const stale = Object.keys(slots).filter(dev =&gt;
+    dev !== keepDev &amp;&amp; now - (slots[dev].ts || 0) &gt; SLOT_IDLE_PRUNE_MS);
+  if (stale.length &amp;&amp; Object.keys(slots).length - stale.length &gt;= 1) {
+    stale.forEach(dev =&gt; { delete slots[dev]; });
+    log(`已清理 ${stale.length} 个闲置数据槽：${stale.join(', ')}`);
+  }
+}
+function writeSlot(payload, dev, baseRev) {
+  /* 槽级乐观锁：baseRev 与该槽当前 rev 不一致 → 409；各设备写各的槽互不冲突 */
+  const d = readData();
+  const slots = d.slots = d.slots || {};
+  const cur = slots[dev] || { rev: 0, ts: 0, payload: null };
+  if (baseRev != null &amp;&amp; cur.rev !== baseRev) {
+    return { ok: false, conflict: true, rev: d.rev || 0, slotRev: cur.rev || 0, payload: cur.payload };
+  }
+  d.rev = (d.rev || 0) + 1;
+  slots[dev] = { rev: d.rev, ts: Date.now(), payload };
+  pruneSlots(d, dev);
+  writeFile(d);
+  return { ok: true, rev: d.rev, ts: d.ts, slotRev: slots[dev].rev };
+}
+function writeLegacy(payload, baseRev) {
+  /* 兼容 R23 旧客户端：整包替换 */
+  const d = readData();
+  if (baseRev != null &amp;&amp; (d.rev || 0) !== baseRev) {
+    return { ok: false, conflict: true, rev: d.rev || 0, slots: d.slots };
+  }
+  d.rev = (d.rev || 0) + 1;
+  d.slots = { legacy: { rev: d.rev, ts: Date.now(), payload } };
+  writeFile(d);
+  return { ok: true, rev: d.rev, ts: d.ts };
+}
+
+function sendJSON(res, obj, code) {
+  const body = Buffer.from(JSON.stringify(obj), 'utf8');
+  res.writeHead(code || 200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  });
+  res.end(body);
+}
+function serveIndex(req, res) {
+  const file = fs.existsSync(INDEX) ? INDEX : findHtml();
+  if (!file) { res.writeHead(404); return res.end('index.html 不存在'); }
+  const body = fs.readFileSync(file);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+function findHtml() {
+  const f = fs.readdirSync(BASE_DIR).filter(x =&gt; /\.html$/i.test(x) &amp;&amp; !/^校园网部署说明/.test(x));
+  return f.length ? path.join(BASE_DIR, f[0]) : null;
+}
+
+const server = http.createServer((req, res) =&gt; {
+  const u = new URL(req.url, 'http://localhost');
+  const q = u.searchParams;
+  const check = () =&gt; q.get('token') === TOKEN;
+
+  if (req.method === 'OPTIONS') return sendJSON(res, { ok: true });
+
+  if (u.pathname === '/api/ping') {
+    return sendJSON(res, { ok: true, name: 'qiwu7', rev: readData().rev, time: new Date().toLocaleString('zh-CN') });
+  }
+
+  if (u.pathname === '/api/sync' &amp;&amp; req.method === 'GET') {
+    if (!check()) return sendJSON(res, { ok: false, error: '口令不对' }, 401);
+    const d = readData();
+    const slots = d.slots || {};
+    /* 客户端带 revs（各槽已知版本，JSON）→ 只回有变化的槽，省带宽 */
+    let revs = {};
+    try { revs = JSON.parse(q.get('revs') || '{}'); if (!revs || typeof revs !== 'object') revs = {}; } catch (e) { revs = {}; }
+    const changed = {};
+    Object.keys(slots).forEach(dev =&gt; {
+      if (!(dev in revs &amp;&amp; revs[dev] === slots[dev].rev)) changed[dev] = slots[dev];
+    });
+    const slotsRev = {};
+    Object.keys(slots).forEach(dev =&gt; { slotsRev[dev] = slots[dev].rev || 0; });
+    return sendJSON(res, { ok: true, rev: d.rev || 0, ts: d.ts || 0, slots: changed, count: Object.keys(slots).length, slotsRev });
+  }
+
+  if (u.pathname === '/api/backup') {
+    if (!check()) return sendJSON(res, { ok: false, error: '口令不对' }, 401);
+    const body = Buffer.from(JSON.stringify(readData()), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': body.length,
+      /* HTTP 头只能装 ASCII：中文文件名必须百分号编码（RFC 5987） */
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent('栖梧7班数据备份.json')}`,
+    });
+    return res.end(body);
+  }
+
+  if (u.pathname === '/api/sync' &amp;&amp; req.method === 'POST') {
+    if (!check()) return sendJSON(res, { ok: false, error: '口令不对' }, 401);
+    let raw = '';
+    let tooBig = false;
+    req.on('data', c =&gt; { raw += c; if (raw.length &gt; 50 * 1024 * 1024) { tooBig = true; req.destroy(); } });
+    req.on('end', () =&gt; {
+      if (tooBig) return;
+      let reqObj = {};
+      try { reqObj = raw ? JSON.parse(raw) : {}; } catch (e) {
+        return sendJSON(res, { ok: false, error: '请求不是合法 JSON：' + e.message }, 400);
+      }
+      const payload = reqObj.payload;
+      if (payload === undefined || payload === null) {
+        return sendJSON(res, { ok: false, error: '缺少 payload' }, 400);
+      }
+      const baseRev = reqObj.baseRev;
+      let r;
+      let dev = null;
+      if (reqObj.deviceId !== undefined &amp;&amp; reqObj.deviceId !== null) {
+        /* R24 新协议：写自己的数据槽 */
+        dev = String(reqObj.deviceId).slice(0, 64) || 'unknown';
+        r = writeSlot(payload, dev, baseRev);
+      } else {
+        /* 旧协议：整包替换（兼容升级过渡期） */
+        r = writeLegacy(payload, baseRev);
+      }
+      if (!r.ok) {
+        return sendJSON(res, {
+          ok: false, conflict: true, rev: r.rev || 0, slotRev: r.slotRev != null ? r.slotRev : undefined,
+          payload: r.payload, slots: r.slots,
+          error: '数据已被其他设备更新，请合并后重试',
+        }, 409);
+      }
+      log(`已同步 rev=${r.rev}（${dev || 'legacy'}，来自 ${req.socket.remoteAddress}）`);
+      return sendJSON(res, { ok: true, rev: r.rev, ts: r.ts, slotRev: r.slotRev });
+    });
+    return;
+  }
+
+  if (req.method === 'GET') return serveIndex(req, res);
+  sendJSON(res, { ok: false, error: 'not found' }, 404);
+});
+
+server.on('error', e =&gt; {
+  console.error(`端口 ${PORT} 起不来：${e.message}\n换一个端口试试，例如：node qiwu7_server.js 9000`);
+  process.exit(1);
+});
+
+server.listen(PORT, () =&gt; {
+  console.log('='.repeat(62));
+  console.log('  栖梧7班班级管理系统 · 校园网服务端已启动（R24 数据槽版 · Node）');
+  console.log('='.repeat(62));
+  console.log(`  本机访问：   http://127.0.0.1:${PORT}`);
+  console.log('  局域网访问： http://&lt;本机IP&gt;:' + PORT + '   ← 把这个地址发给老师 / 输进一体机');
+  console.log(`  班级口令：   ${TOKEN}`);
+  if (TOKEN === 'qiwu7') {
+    console.log('  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+    console.log('  !! 安全警告：你现在用的是【默认口令 qiwu7】，请尽快改掉  !!');
+    console.log('  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+  }
+  console.log(`  数据文件：   ${DATA_FILE}`);
+  console.log('  提醒：第一次打开网页后，要去「设置 / 数据 → 🌐 校园网同步」');
+  console.log('        填上面的地址与口令，点「立即同步」，三端就通了。');
+  console.log('='.repeat(62));
+});
+</code></pre></details>
+<h3>启动方式（不用 .bat 也完全可以）</h3>
+<p>把 <code>index.html</code> 和刚保存的 <code>qiwu7_server.py</code> 放在<b>同一个文件夹</b>里，然后：</p>
+<pre><code>:: Windows：文件夹地址栏敲 cmd 回车，然后
+python qiwu7_server.py          :: 默认 8080 端口
+python qiwu7_server.py 9000     :: 8080 被占用就换一个
+
+:: 想改口令（强烈建议）：
+set QIWU7_TOKEN=你自己想的口令
+python qiwu7_server.py</code></pre>
+<pre><code># Linux / macOS：
+QIWU7_TOKEN=你自己想的口令 python3 qiwu7_server.py</code></pre>
+<div class="callout ok">窗口里会打印 <code>http://192.168.x.x:8080</code>，把这个地址发给班主任即可。不想要了直接关窗口。</div>
+</div>
+<div class="card">
+<h2>0 · 一句话：这是个什么东西</h2>
+<p>这是一个<b>班级管理网页</b>（班主任用的：学生名单、加减分、考勤、成绩分析、表扬墙、奖品兑换……）。
+    现在要把它放到校园网里，让<b>老师的办公电脑、课室的一体机、学生登录的个人端</b>都能打开同一个网址，
+    并且<b>数据实时同步</b>——谁改了什么，其他端几十秒内就能看到。</p>
+<div class="callout ok"><b>技术形态很简单：</b>一个 HTML 网页 + 一个只有一百多行的同步服务（Python 或 Node 二选一，
+    <b>不需要装任何第三方库</b>、不需要数据库、不需要外网、不花钱）。数据就存成服务器上的一个 JSON 文件。</div>
+</div>
+<div class="card">
+<h2>1 · 需要什么（很低的门槛）</h2>
+<table>
+<tr><th style="width:150px">项目</th><th>要求</th></tr>
+<tr><td><b>一台机器</b></td><td>校园网内一台<b>常开</b>的电脑或服务器。办公机、机房机器都行。
+        配置无要求（1 核 1G 都够）。<b>关机 = 大家同步不了</b>（但已打开的设备仍能离线用，恢复后自动补同步）。</td></tr>
+<tr><td><b>运行环境</b></td><td><b>Python 3.6+</b>（推荐）或 <b>Node 12+</b>，有一个就行。Linux 一般自带 Python3。</td></tr>
+<tr><td><b>一个端口</b></td><td>默认 <code>8080</code>。被占用就换（9000、8888 都行）。校园网内互通即可。</td></tr>
+<tr><td><b>磁盘</b></td><td>几十 MB 足够（含自动备份）。</td></tr>
+<tr><td><b>不需要</b></td><td>不需要域名、不需要公网 IP、不需要备案、不需要数据库、不需要外网访问。</td></tr>
+</table>
+</div>
+<div class="card">
+<h2>2 · 三步部署</h2>
+<div class="step"><div class="n">1</div><div class="b">
+<b>把整个文件夹拷到那台机器上</b><br/>
+<span class="muted">建议放在一个不会被清理的地方，例如 <code>D:\qiwu7\</code> 或 <code>/opt/qiwu7/</code>。文件夹里应该有：</span>
+<table>
+<tr><th style="width:190px">文件</th><th>作用</th></tr>
+<tr><td><code>index.html</code></td><td>主程序（约 1.2 MB，单文件、零依赖）</td></tr>
+<tr><td><code>qiwu7_server.py</code></td><td>同步服务端（Python 版，<b>推荐</b>）</td></tr>
+<tr><td><code>qiwu7_server.js</code></td><td>同步服务端（Node 版，备选，功能一样）</td></tr>
+<tr><td><code>启动_Windows.bat</code></td><td>Windows 双击即启动</td></tr>
+<tr><td><code>启动_Linux.sh</code></td><td>Linux 启动脚本</td></tr>
+<tr><td><code>qiwu7_data\</code></td><td>数据目录（程序自己创建，不用管）</td></tr>
+</table>
+</div></div>
+<div class="step"><div class="n">2</div><div class="b">
+<b>改口令 + 启动</b><br/>
+<b>Windows：</b>右键用记事本打开 <code>启动_Windows.bat</code>，把 <code>set QIWU7_TOKEN=qiwu7</code>
+      里的 <code>qiwu7</code> 改成一个你们自己的口令 → 保存 → <b>双击启动</b>。<br/>
+<b>Linux：</b>
+<pre><code>cd /opt/qiwu7
+chmod +x 启动_Linux.sh
+QIWU7_TOKEN=你们自己的口令 ./启动_Linux.sh</code></pre>
+<span class="muted">启动后窗口会显示一个 <b>http://192.168.x.x:8080</b> 这样的地址——<b>把这个地址告诉班主任</b>，就是全部。</span>
+</div></div>
+<div class="step"><div class="n">3</div><div class="b">
+<b>放行防火墙（Windows 常见）</b><br/>
+      如果其他电脑打不开这个地址，多半是防火墙挡了。Windows 上以管理员身份执行一次即可：
+      <pre><code>netsh advfirewall firewall add rule name="qiwu7" dir=in action=allow protocol=TCP localport=8080</code></pre>
+<span class="muted">Linux： <code>sudo ufw allow 8080/tcp</code> 或 <code>sudo firewall-cmd --add-port=8080/tcp --permanent &amp;&amp; sudo firewall-cmd --reload</code></span>
+</div></div>
+<div class="callout"><b>验证是否成功：</b>在<b>另一台</b>电脑上打开浏览器，访问
+      <code>http://服务器IP:8080/api/ping</code> —— 看到 <code>{"ok":true,...}</code> 就是通了。
+      再访问 <code>http://服务器IP:8080</code> 应该看到班级管理系统的登录页。</div>
+</div>
+<div class="card">
+<h2>3 · 班主任那边要做什么（不用您操心，了解一下即可）</h2>
+<ol>
+<li>在教师端（办公电脑）打开 <code>http://服务器IP:8080</code> → 登录 → 「<b>设置 / 数据</b>」→「🌐 校园网同步」</li>
+<li>填上服务器地址（<code>http://192.168.x.x:8080</code>）和口令 → 勾「启用校园网同步」→ 点「保存并连接」</li>
+<li>课室一体机、学生个人端打开同一个网址即可 —— <b>同步配置会自动跟着数据过去，不用一台台填</b></li>
+</ol>
+<div class="callout ok">到此结束。后面老师自己会用，理论上不需要您再介入。</div>
+</div>
+<div class="card">
+<h2>4 · 常见问题</h2>
+<table>
+<tr><th style="width:220px">现象</th><th>怎么办</th></tr>
+<tr><td>提示「端口被占用」</td><td>换端口：Windows 改 bat 里的 <code>QIWU7_PORT</code>；Linux 用
+        <code>QIWU7_PORT=9000 ./启动_Linux.sh</code>。也可以命令行直接 <code>python qiwu7_server.py 9000</code>。</td></tr>
+<tr><td>本机打得开，别的电脑打不开</td><td>① 防火墙没放行（见第 2 步第 3 点）② 两台机器不在同一个网段/VLAN
+        ③ 地址里的 IP 写错了（要用 <b>192.168.x.x</b> 那种局域网 IP，不是 127.0.0.1）。</td></tr>
+<tr><td>没有 Python 也没有 Node</td><td>装 Python 最省事：python.org 下载，<b>安装时勾选 "Add Python to PATH"</b>。
+        Linux：<code>sudo apt install -y python3</code>。</td></tr>
+<tr><td>电脑重启后就没了</td><td>需要开机自启。Windows：把 <code>启动_Windows.bat</code> 的快捷方式放进
+        <code>shell:startup</code> 目录。Linux：写一个 systemd 服务（下面是模板）。</td></tr>
+<tr><td>数据存在哪</td><td><code>qiwu7_data/data.json</code>。每次写入前自动备份到
+        <code>qiwu7_data/backups/</code>，<b>保留最近 10 份</b>。可以直接拷贝整个文件夹做冷备份。</td></tr>
+<tr><td>数据文件损坏了</td><td>程序会自动回退到最近一份备份。也可以手动从 <code>backups/</code> 里挑一份改名覆盖 <code>data.json</code>。</td></tr>
+<tr><td>想看服务器有没有在跑</td><td>浏览器打开 <code>http://服务器IP:8080/api/ping</code>，返回
+        <code>{"ok":true,"rev":N}</code> 就正常，<code>rev</code> 是数据版本，每次同步 +1。</td></tr>
+<tr><td>多人同时改会不会乱</td><td>不会。服务端有<b>乐观锁</b>：如果两台设备同时改，后提交的会收到冲突提示，
+        客户端自动重新合并再提交。数据包本身按唯一编号合并，<b>重复提交不会重复计分</b>。</td></tr>
+<tr><td>服务器关了会怎样</td><td>所有端自动降级为<b>本地模式</b>，功能照常用（数据存在各自浏览器里）；
+        服务器恢复后自动接着同步，不会丢。</td></tr>
+</table>
+</div>
+<div class="card">
+<h2>5 · Linux 开机自启（可选，给需要长期运行的场景）</h2>
+<pre><code># /etc/systemd/system/qiwu7.service
+[Unit]
+Description=Qiwu7 Class Sync Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qiwu7
+Environment=QIWU7_TOKEN=你们的口令
+Environment=QIWU7_PORT=8080
+ExecStart=/usr/bin/python3 /opt/qiwu7/qiwu7_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<div class="muted">然后：<code>sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now qiwu7</code>　
+      查看状态：<code>systemctl status qiwu7</code>　看日志：<code>journalctl -u qiwu7 -f</code></div>
+</div>
+<div class="card">
+<h2>6 · 安全提醒</h2>
+<div class="callout warn">
+<b>① 一定要改掉默认口令 <code>qiwu7</code></b> —— 这个口令是唯一的一道门，虽然只在校园网内。<br/>
+<span style="font-size:13px">　　<b>不改会怎样？</b><code>qiwu7</code> 是公开写在启动脚本和本文档里的，等于没锁。校园网内任何知道这台机器地址的人，</span><br/>
+<span style="font-size:13px">　　都能直接下载全班数据（成绩 / 名单 / 记录），也能提交假数据覆盖整库。服务启动时如果还是默认口令，会打印醒目警告。</span><br/>
+<span style="font-size:13px">　　⚠ <b>改完口令，教师端「设置 / 数据 → 🌐 校园网同步」里的口令也要跟着改</b>，否则会提示「口令不对」。</span><br/>
+<b>② 只在校园网内放通端口</b>，不要在路由器上做端口映射暴露到公网。<br/>
+<b>③ 建议每周把 <code>qiwu7_data</code> 整个文件夹复制一份</b>到网盘或移动硬盘（里面有自动备份）。<br/>
+<b>④ 数据含学生姓名与成绩</b>，属敏感信息，请按学校规定保管；不用时直接关掉服务即可。
+    </div>
+</div>
+<div class="card">
+<h2>7 · 接口一览（一般不用看）</h2>
+<table>
+<tr><th style="width:280px">接口</th><th>说明</th></tr>
+<tr><td><code>GET /api/ping</code></td><td>健康检查，返回服务器时间与当前数据版本 <code>rev</code></td></tr>
+<tr><td><code>GET /api/sync?token=口令</code></td><td>拉取全量数据（JSON）</td></tr>
+<tr><td><code>POST /api/sync?token=口令</code></td><td>提交全量数据，body 为 <code>{"payload":{...},"baseRev":N}</code>；
+        <code>baseRev</code> 与服务器不一致时返回 <b>409</b> 并把最新数据一并返回</td></tr>
+<tr><td><code>GET /api/backup?token=口令</code></td><td>下载一份完整数据备份（.json）</td></tr>
+<tr><td><code>GET /</code></td><td>主程序页面</td></tr>
+</table>
+</div>
+<footer>
+    栖梧7班班级管理系统 · 校园网部署说明 · 程序版本 v1.12-2026-10-16-r23<br/>
+    有任何部署问题，把启动窗口里的报错截图发给班主任即可
+  </footer>
+</div>
+<style>
+  .cbtn{background:var(--primary);color:#fff;border:none;border-radius:8px;padding:8px 16px;
+        font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
+  .cbtn:hover{filter:brightness(1.1)}
+  details{margin:8px 0}
+  details summary{cursor:pointer;color:var(--primary);font-weight:600;font-size:14px}
+</style>
+<script>
+function copySrc(id){
+  var el=document.getElementById(id); if(!el)return;
+  var txt=el.innerText;
+  var done=function(ok){
+    var tip=document.getElementById(id.replace('src-','tip-'));
+    if(tip){tip.textContent = ok? '✓ 已复制，去记事本粘贴吧' : '✗ 复制失败，请手动选中下面代码复制';
+            tip.style.color = ok? 'var(--green)' : 'var(--red)';
+            setTimeout(function(){tip.textContent=''},4000);}
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){done(true)},function(){done(false)});
+    return;
+  }
+  var t=document.createElement('textarea'); t.value=txt; t.style.position='fixed'; t.style.left='-9999px';
+  document.body.appendChild(t); t.select();
+  var ok=false; try{ ok=document.execCommand('copy'); }catch(e){}
+  document.body.removeChild(t); done(ok);
+}
+</script>
+</body>
+</html>
