@@ -325,7 +325,7 @@ const KEY_PERSONAL_SID='qiwu7_personal_sid_v1';
 const DEVICE_KEY='qiwu7_device_v1';       // 本机设备编号
 const PIN_KEY='qiwu7_pin_v1';             // 学生端敏感操作 PIN 码
 const SYNC_VER=2;                          // 同步文件格式版本（R24：服务器按设备分槽存储）
-const BUILD_VERSION='v1.15-2026-10-20-r26';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
+const BUILD_VERSION='v1.15-2026-10-21-r26d';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
 const BUILD_VERSION_KEY='qiwu7_build_v1';
 const pad2=n=>n<10?'0'+n:''+n;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1963,11 +1963,12 @@ function confirmModal(title,msg,onOk,onCancel){
   if(ok)ok.onclick=()=>{closeModal();try{onOk&&onOk()}catch(e){console.error(e)}};
   if(cn)cn.onclick=()=>{closeModal();try{onCancel&&onCancel()}catch(e){console.error(e)}};
 }
-/* 应用内信息弹窗：仅一个"知道了"按钮 */
-function alertModal(title,msg){
-  confirmModal(title,msg,null,null);
+/* 应用内信息弹窗：仅一个"知道了"按钮。
+   R26-fix：新增可选第三参 onOk —— 传了就走「确定」语义并在点后回调（用于"点确定→接着打开某个弹窗"的引导） */
+function alertModal(title,msg,onOk){
+  confirmModal(title,msg,onOk,null);
   const cn=$('#cm-cancel');if(cn)cn.style.display='none';
-  const ok=$('#cm-ok');if(ok)ok.textContent='知道了';
+  const ok=$('#cm-ok');if(ok)ok.textContent=onOk?'确定':'知道了';
 }
 function confirmDo(msg,fn){confirmModal('请确认',msg,fn)}
 
@@ -2263,7 +2264,21 @@ function bindScore(){
       });
     };
     /* 若已授权，跳过门控卡，直接绑定登记按钮 */
-    if(!roomScoreAuth())return;
+    /* R26-fix：未授权（含授权 15 分钟过期）时，名单上的姓名照样渲染但按钮没绑定 →
+       点下去毫无反应、也没有任何提示，表现为「扣分键坏了」。
+       这里补一层：点了直接弹出班干验证窗，让操作有明确反馈。 */
+    if(!roomScoreAuth()){
+      document.querySelectorAll('[data-score]').forEach(el=>el.onclick=()=>{
+        /* 授权记录还在但已超时 → 说明是「授权过期」，提示文案要不一样 */
+        let expired=false;
+        try{const raw=localStorage.getItem(ROOM_SCORE_AUTH_KEY);if(raw){const o=JSON.parse(raw);if(o&&o.until)expired=true;}}catch(_){}
+        alertModal('需要先验证身份',
+          (expired?'当前班干授权已过期（授权有效期 15 分钟）。':'班干登记加扣分前，需要先验证身份。')
+          +'点「确定」打开验证窗，验证通过后即可登记。',
+          ()=>openRoomScoreAuthModal());
+      });
+      return;
+    }
   }
   /* 个人端：瓦片点击进入对应弹窗 */
   if(isPersonal()){
@@ -2582,7 +2597,7 @@ function openScoreModal(sid){
       html+=`<tr><td>${r.timeStr||''}</td><td>${esc(r.cat||'-')}${r.sub?` · ${esc(r.sub)}`:''}</td><td>${r.type==='bonus'?'<span class="tag g">加分</span>':'<span class="tag d">扣分</span>'}</td>
       <td style="color:${r.type==='bonus'?'var(--green)':'var(--red)'};font-weight:700">${r.type==='bonus'?'+':'-'}${r.amount}</td>
       <td style="text-align:left">${esc(r.reason||'')}</td><td>${r.source==='attendance'?'<span class="tag late">考勤</span>':(r.operator?`<span class="tag n">${esc(r.operator)}</span>`:(r.batchId?'<span class="tag g">批量</span>':'手动'))}</td>
-      <td>${r.batchId?`<button class="btn ghost sm" data-batch-undo="${r.batchId}">撤销整批(${grouped['batch-'+r.batchId].items.length})</button>`
+      <td>${r.batchId?`<button class="btn ghost sm" data-batch-undo="${r.batchId}">撤销整批(${(grouped[r.batchId]||{items:[]}).items.length})</button>`
               :`<button class="btn ghost sm" data-su="${r.id}">撤销</button>`}</td></tr>`;
     });
     html+='</table>';
@@ -5949,6 +5964,20 @@ function viewGrowth(){
 function bindGrowth(){
   if(isPersonal())return;   /* 个人端只在 viewGrowth 里直接读 state.pushedGrowth */
   if(!isTeacher())return;
+  /* R26-fix：「↩ 一键撤回成长报告」是 viewGrowth 静态渲染的按钮，
+     原先误写在「一键生成」的点击回调里 → 没点生成就点撤回 = 毫无反应。
+     这里提到函数体最前面，保证每次 bindGrowth 都绑上。 */
+  {
+    const btnUnpushAll=$('#gr-unpush-all');
+    if(btnUnpushAll)btnUnpushAll.onclick=()=>{
+      const ids=state.students.filter(s=>growthPushed(s.id)).map(s=>s.id);
+      if(!ids.length)return toast('当前没有已推送的成长报告');
+      confirmDo(`撤回全部 ${ids.length} 人的成长报告？\n\n撤回后学生个人端立即看不到（可随时再推送恢复）。`,()=>{
+        ids.forEach(id=>withdrawGrowth(id));
+        save();render();toast('✅ 已撤回 '+ids.length+' 人的成长报告');
+      });
+    };
+  }
   const btnGen=$('#gr-gen');if(!btnGen)return;
   /* 📄 一键下载全班为 PDF — 复用 printAllReports 的 iframe 模式 */
   const btnPrint=$('#gr-print-all');
@@ -6037,16 +6066,8 @@ function bindGrowth(){
         toast('✅ 已推送给全部 '+cnt+' 人');
       });
     };
-    /* R26：一键撤回 / 单个撤回（成长报告） */
-    const btnUnpushAll=$('#gr-unpush-all');
-    if(btnUnpushAll)btnUnpushAll.onclick=()=>{
-      const ids=state.students.filter(s=>growthPushed(s.id)).map(s=>s.id);
-      if(!ids.length)return toast('当前没有已推送的成长报告');
-      confirmDo(`撤回全部 ${ids.length} 人的成长报告？\n\n撤回后学生个人端立即看不到（可随时再推送恢复）。`,()=>{
-        ids.forEach(id=>withdrawGrowth(id));
-        save();render();toast('✅ 已撤回 '+ids.length+' 人的成长报告');
-      });
-    };
+    /* R26：单个撤回（成长报告）—— 这些按钮属于「生成预览」后动态渲染的表格，
+       所以绑定必须留在 btnGen 的回调里 */
     document.querySelectorAll('[data-gr-withdraw]').forEach(b=>b.onclick=()=>{
       const sid=b.dataset.grWithdraw;
       const stu=state.students.find(s=>s.id===sid);
