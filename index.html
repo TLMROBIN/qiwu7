@@ -325,7 +325,7 @@ const KEY_PERSONAL_SID='qiwu7_personal_sid_v1';
 const DEVICE_KEY='qiwu7_device_v1';       // 本机设备编号
 const PIN_KEY='qiwu7_pin_v1';             // 学生端敏感操作 PIN 码
 const SYNC_VER=2;                          // 同步文件格式版本（R24：服务器按设备分槽存储）
-const BUILD_VERSION='v1.15-2026-10-22-r26e';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
+const BUILD_VERSION='v1.15-2026-10-22-r26g';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
 const BUILD_VERSION_KEY='qiwu7_build_v1';
 const pad2=n=>n<10?'0'+n:''+n;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1025,6 +1025,21 @@ function cloudOn(){const c=cloudCfg();return c.on&&!!c.url&&typeof fetch==='func
 function cloudSet(mode,text){cloudStat={mode:mode,text:text,at:Date.now(),rev:cloudRev};
   const el=document.getElementById&&document.getElementById('cloud-stat');
   if(el)el.innerHTML=cloudStatHtml();
+  const rb=document.getElementById&&document.getElementById('rb-sync');   /* R26f：顶栏徽标一起刷新 */
+  if(rb)rb.innerHTML=cloudBadgeHtml();
+}
+/* R26f：顶栏小徽标（个人端 / 班级端也看得到，学生可自助点一下同步） */
+function cloudBadgeHtml(){
+  const s=cloudStat;
+  if(s.mode==='ok')return '☁️ 已同步';
+  if(s.mode==='syncing')return '🔄 同步中';
+  if(s.mode==='off')return '⚪ 离线';
+  return '⚠️ 未同步';
+}
+/* R26f：登录 / 切换角色后立刻拉一次，保证学生一进个人端看到的就是最新数据 */
+function cloudSyncAfterLogin(){
+  if(!cloudOn())return;
+  cloudPull(true).then(()=>{if(typeof render==='function')render();});
 }
 function cloudStatHtml(){
   const s=cloudStat;
@@ -1035,22 +1050,44 @@ function cloudStatHtml(){
 }
 function cloudStoreRev(v){cloudRev=v;try{localStorage.setItem('qiwu7_cloud_rev',String(v))}catch(e){}}
 function cloudLoadRev(){try{cloudRev=+(localStorage.getItem('qiwu7_cloud_rev')||0)||0}catch(e){cloudRev=0}}
-/* ===== R26：打开网址即自动连上（补齐线上 r25c 缺失的这段）=====
-   页面如果是从校园网服务器打开的，服务端会把 {url, token} 注入成 window.__QIWU7_CLOUD__。
-   一体机、学生手机没有设置页可填地址口令 → 本地配置为空 → cloudOn() 为 false → 永远不拉取，
-   表现为「电脑上改了，手机上看不到」。老师若手动填过别的地址，以手动为准。 */
+/* ===== R26f：任意设备开箱即用（新设备不再需要先登录教师端填口令）=====
+   原因：本班服务器（IT 老师自写的那版）**不会**往页面里注入凭据，
+   所以学生平板 / 一体机打开后 settings.cloud 是空的 → cloudOn() 为 false → 永远不拉取，
+   表现为「新设备只有原始数据」。现在改成三条腿走路，任何一条命中即可同步：
+     ① 配置链接 ?cloud=<地址>&tk=<口令>（老师发一次，学生点开永久生效）
+     ② 从服务器打开时服务端注入的 window.__QIWU7_CLOUD__（服务器升级后完全无感）
+     ③ 内置默认地址（兜底，新设备开箱即连；口令由 ①② 补上）
+   教师端手动填的地址口令始终优先，不会被覆盖。 */
+var DEFAULT_CLOUD_URL='http://10.50.159.62:18090';
+var DEFAULT_CLOUD_TOKEN='qiwu7-9614265d';   /* 2026-10-22 老师提供，已实测可拉可推 */
+function _cloudNorm(u){return String(u||'').replace(/\/+$/,'')}
 function cloudAutoSetup(){
   try{
-    const boot=(typeof window!=='undefined')?window.__QIWU7_CLOUD__:null;
-    if(!boot||!boot.url)return false;
     if(!state.settings)state.settings={};
     const c=state.settings.cloud||{on:false,url:'',token:''};
-    const manual=!!c.url && String(c.url).replace(/\/+$/,'')!==String(boot.url).replace(/\/+$/,'');
-    if(manual)return false;                       /* 老师自己填了别的服务器 → 不覆盖 */
     let changed=false;
-    if(c.url!==boot.url){c.url=boot.url;changed=true}
-    if(boot.token&&c.token!==boot.token){c.token=boot.token;changed=true}  /* 服务器改了口令，各端自动跟上 */
-    if(!c.on){c.on=true;changed=true}
+    /* ① 配置链接：/?cloud=...&tk=... —— 老师发到群里，学生点一次就永久记住 */
+    try{
+      const q=new URLSearchParams((typeof location!=='undefined'&&location.search)||'');
+      const qu=_cloudNorm(q.get('cloud')||q.get('srv')||'');
+      const qt=String(q.get('tk')||q.get('token')||'');
+      if(qu&&qu!==_cloudNorm(c.url)){c.url=qu;changed=true}
+      if(qt&&qt!==c.token){c.token=qt;changed=true}
+      if(qu||qt){c.on=true;changed=true}
+    }catch(e){}
+    /* ② 服务端注入（页面是从校园网服务器打开的） */
+    const boot=(typeof window!=='undefined')?window.__QIWU7_CLOUD__:null;
+    if(boot&&boot.url){
+      const manual=!!c.url&&_cloudNorm(c.url)!==_cloudNorm(boot.url);   /* 老师手填了别的服务器 → 不覆盖 */
+      if(!manual){
+        if(c.url!==boot.url){c.url=boot.url;changed=true}
+        if(boot.token&&c.token!==boot.token){c.token=boot.token;changed=true}  /* 服务器改了口令，各端自动跟上 */
+        if(!c.on){c.on=true;changed=true}
+      }
+    }
+    /* ③ 兜底：本机从没配过地址 → 直接用内置默认地址（新设备不用任何人操作） */
+    if(!c.url&&DEFAULT_CLOUD_URL){c.url=DEFAULT_CLOUD_URL;c.on=true;changed=true}
+    if(!c.token&&DEFAULT_CLOUD_TOKEN){c.token=DEFAULT_CLOUD_TOKEN;changed=true}
     state.settings.cloud=c;
     if(changed&&typeof save==='function')save();
     return changed;
@@ -1439,7 +1476,7 @@ function hidePortal(){const p=$('#portal');if(p)p.style.display='none'}
 function bindPortal(){
   const $or=(sel,fn)=>{const e=$(sel);if(e)fn(e)};
   $or('#portal-classroom',e=>e.onclick=()=>{
-    currentRole='classroom';saveRole('classroom');hidePortal();curTab='attend';render();toast('欢迎进入班级端（一体机）');
+    currentRole='classroom';saveRole('classroom');hidePortal();curTab='attend';render();cloudSyncAfterLogin();toast('欢迎进入班级端（一体机）');
   });
   $or('#portal-teacher',e=>e.onclick=()=>{$('#portal-form').style.display='block';$('#portal-personal-form').style.display='none';$('#pt-user').focus()});
   $or('#portal-personal',e=>e.onclick=()=>{$('#portal-personal-form').style.display='block';$('#portal-form').style.display='none';$('#pp-account').focus()});
@@ -1449,7 +1486,7 @@ function bindPortal(){
     if(checkTeacher(u,p)){
       currentRole='teacher';saveRole('teacher');hidePortal();curTab='roster';
       $('#pt-pass').value='';$('#pt-user').value='';
-      render();toast('欢迎进入教师端');
+      render();cloudSyncAfterLogin();toast('欢迎进入教师端');
     }
     else{showPortalTip('账号或密码错误');$('#pt-pass').value=''}
   });
@@ -1462,7 +1499,7 @@ function bindPortal(){
       try{localStorage.setItem(KEY_PERSONAL_SID,r.sid)}catch(e){}
       saveRole('personal');hidePortal();curTab='attend';
       $('#pp-pass').value='';$('#pp-account').value='';
-      render();toast('欢迎 「'+r.name+'」同学进入个人端 🐖');
+      render();cloudSyncAfterLogin();toast('欢迎 「'+r.name+'」同学进入个人端 🐖');
     }else{
       showPersonalTip('账号或密码错误，请检查');
       $('#pp-pass').value='';
@@ -1500,7 +1537,12 @@ function renderRoleBadge(){
   }
   const mailCount=isTeacher()?unreadFeedbackCount():0;
   const mailBadge=mailCount?`<span class="mailbox-badge">${mailCount}</span>`:'';
-  el.innerHTML=`<span><b style="font-size:14px">${esc(label)}</b>${nameHtml}</span>${isTeacher()?`<span class="mailbox-btn" id="rb-mail" title="反馈总池">📬${mailBadge}</span>`:''}<button class="btn ghost sm" id="rb-logout">切换</button>`;
+  el.innerHTML=`<span><b style="font-size:14px">${esc(label)}</b>${nameHtml}</span>${isTeacher()?`<span class="mailbox-btn" id="rb-mail" title="反馈总池">📬${mailBadge}</span>`:''}<span class="mailbox-btn" id="rb-sync" title="点击立即从校园网拉取最新数据">${cloudBadgeHtml()}</span><button class="btn ghost sm" id="rb-logout">切换</button>`;
+  const sy=$('#rb-sync');
+  if(sy)sy.onclick=()=>{
+    if(!cloudOn()){alertModal('还没连上校园网','请确认这台设备连着校园网 Wi-Fi。若一直连不上，让老师把「学生配置链接」发给你，点开一次即可。');return}
+    cloudSync().then(ok=>{render();toast(ok?'🔄 已同步到最新数据':'⚠️ 连不上服务器，请确认连着校园网 Wi-Fi')});
+  };
   const logout=$('#rb-logout');if(logout)logout.onclick=()=>{
     clearRole();currentRole=null;currentPersonalSid='';showPortal();render();
   }
@@ -6999,10 +7041,11 @@ function cloudSettingHtml(){
       <button class="btn sm green" id="cl-save" type="button">保存并连接</button>
       <button class="btn ghost sm" id="cl-sync" type="button">🔄 立即同步</button>
       <button class="btn ghost sm" id="cl-test" type="button">测试连接</button>
+      <button class="btn ghost sm" id="cl-link" type="button">🔗 生成学生配置链接</button>
     </div>
     <div class="help" style="font-size:12px;margin-top:10px;line-height:1.8">
-      💡 <b>只要教师端填一次</b>：教师端填好地址+口令 → 点「保存并连接」→ 其他端打开后会自动拿到同样的设置（设置随数据一起同步）。<br>
-      💡 前端每 30 秒自动拉一次；本地一有改动 1.5 秒后自动上传。<br>
+      💡 <b>R26f 起新设备开箱即用</b>：服务器地址已内置在程序里，学生平板 / 一体机打开后会自动连；口令若为空白，用下面的「🔗 生成学生配置链接」发到群里，学生点开一次就永久记住。<br>
+      💡 前端每 30 秒自动拉一次；本地一有改动 1.5 秒后自动上传；顶栏右上角的 ☁️ 徽标可随时手动点一下同步。<br>
       💡 数据存在服务器的 <code>qiwu7_data/data.json</code>，每次改动自动留一份备份（保留最近 10 份）。
     </div>
   </div>`;
@@ -7117,6 +7160,19 @@ function bindSetting(){
     if(sy)sy.onclick=()=>{
       if(!cloudOn()){alertModal('还没开启校园网同步','先填地址与口令，勾选「启用校园网同步」，再点「保存并连接」。');return}
       cloudSync().then(ok=>{render();toast(ok?'🔄 同步完成':'⚠️ 同步失败，已保持本地模式')});
+    };
+    /* R26f：生成「学生配置链接」——老师发到班级群，学生点一次即永久配好，无需登录教师端 */
+    const lk=$('#cl-link');
+    if(lk)lk.onclick=()=>{
+      readCloud();save();
+      const c=state.settings.cloud||{};
+      if(!c.url||!c.token){alertModal('请先配好再生成','先填好服务器地址和班级口令，勾选「启用校园网同步」，再点这个按钮。');return}
+      const link=_cloudNorm(c.url)+'/?cloud='+encodeURIComponent(_cloudNorm(c.url))+'&tk='+encodeURIComponent(c.token);
+      let ok=false;
+      try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(link);ok=true}}catch(e){}
+      alertModal(ok?'🔗 配置链接已复制':'🔗 学生配置链接',
+        '把这条链接发到班级群 / 家长群，学生（或家长）在自己平板上点开一次，之后就自动同步，不用再登录教师端：\n\n'+link+
+        (ok?'':'\n\n（自动复制失败，请手动选中上面的链接复制）'));
     };
     const ts=$('#cl-test');
     if(ts)ts.onclick=async()=>{
