@@ -325,7 +325,7 @@ const KEY_PERSONAL_SID='qiwu7_personal_sid_v1';
 const DEVICE_KEY='qiwu7_device_v1';       // 本机设备编号
 const PIN_KEY='qiwu7_pin_v1';             // 学生端敏感操作 PIN 码
 const SYNC_VER=2;                          // 同步文件格式版本（R24：服务器按设备分槽存储）
-const BUILD_VERSION='v1.15-2026-10-21-r26d';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
+const BUILD_VERSION='v1.15-2026-10-22-r26e';    // 每次改 HTML 都要 bump 这个号（用于硬刷新横幅检测）
 const BUILD_VERSION_KEY='qiwu7_build_v1';
 const pad2=n=>n<10?'0'+n:''+n;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1414,8 +1414,10 @@ function isPersonal(){return currentRole==='personal'}
 function isStudent(){return currentRole==='student' || currentRole==='personal'}
 function visibleTabs(){
   if(isTeacher())return TABS;
-  /* R22：班级端（一体机）不再有考勤，改为只读表扬墙 */
-  if(isClassroom())return TABS.filter(t=>['rules','score','feedback','rank','prize','nominate'].includes(t.id));
+  /* R22：班级端（一体机）不再有考勤，改为只读表扬墙
+     R26e：班级端去掉「反馈总池」——一体机是全班共用设备，不适合当反馈入口；
+           学生反馈保留在个人端（手机），教师端总池照常汇总两端 */
+  if(isClassroom())return TABS.filter(t=>['rules','score','rank','prize','nominate'].includes(t.id));
   if(isPersonal())return TABS.filter(t=>['rules','attend','feedback','rank','prize','report','growth','nominate'].includes(t.id));
   return [];
 }
@@ -1894,7 +1896,8 @@ function renderNav(){
     let badge='';
     if(t.id==='mailbox'&&unread>0)badge=`<span class="nav-badge">${unread>99?'99+':unread}</span>`;
     if(t.id==='attend'&&pendingRmk>0)badge=`<span class="nav-badge">${pendingRmk>99?'99+':pendingRmk}</span>`;
-    return `<button data-t="${t.id}" class="${t.id===curTab?'active':''}">${t.label}${badge}</button>`;
+    const label=(t.id==='feedback'&&!isTeacher())?'我要反馈':t.label;   /* R26e：非教师端看到的其实是提交入口，不是总池 */
+    return `<button data-t="${t.id}" class="${t.id===curTab?'active':''}">${label}${badge}</button>`;
   }).join('');
   $('#nav').querySelectorAll('button').forEach(b=>b.onclick=()=>{curTab=b.dataset.t;render()});
   const wk=currentWeekKey();
@@ -1902,6 +1905,8 @@ function renderNav(){
   renderRoleBadge();
 }
 function render(){
+  /* R26e：班级端已移除「反馈」标签，万一还停留在它上面就切回条例，避免空白页 */
+  if(isClassroom()&&curTab==='feedback')curTab='rules';
   renderNav();
   const c=$('#content');
   try{
@@ -6343,14 +6348,15 @@ function viewPrize(){
         </tr>`).join('')}</table>`:`<div class="empty">还没有申请过兑换</div>`}
     </div>`;
   }
-  /* 班级端：可新增奖品（同步给两端） */
-  return `<div class="card"><h3><span>🎁 奖品兑换池（班级端 · 可录入）</span>
-    <span style="display:flex;gap:6px">${copyBtn}<button class="btn sm" id="pz-add">+ 新增奖品</button></span></h3>
-    <div class="muted">班级端可协助老师录入奖品；个人端只能申请兑换。</div>
+  /* 班级端：只读展示教师端录入的奖品（R26e：班级端不再能录入/新增奖品）
+     奖品由教师端统一录入后同步过来；班级端只保留「复制奖品池」给个人端导入 */
+  return `<div class="card"><h3><span>🎁 奖品兑换池（班级端 · 只读）</span>
+    <span style="display:flex;gap:6px">${copyBtn}</span></h3>
+    <div class="muted">奖品由<b>教师端</b>统一录入，班级端只可查看；如需新增/修改奖品，请在教师端操作后同步。</div>
     <div class="muted" style="font-size:12px">💡 跨设备请点 <b>📋 复制奖品池</b>，把 JSON 发给个人端学生粘贴导入。</div>
     ${prizes.length?`<table><tr><th>奖品</th><th>积分</th><th>说明</th></tr>${
       prizes.map(p=>`<tr><td>${esc(p.name)}</td><td>${p.cost}</td><td>${esc(p.desc||'')}</td></tr>`).join('')
-    }</table>`:`<div class="empty">还没有奖品</div>`}
+    }</table>`:`<div class="empty">还没有奖品，请在教师端「奖品兑换」里新增后同步过来</div>`}
   </div>`;
 }
 function bindPrize(){
@@ -6407,9 +6413,8 @@ function bindPrize(){
     });
   }
   if(isClassroom()){
-    const addBtn=$('#pz-add');
-    if(addBtn)addBtn.onclick=()=>openPrizeEditModal();
-    bindPrizeCopy();   /* 📋 班级端也能复制 */
+    /* R26e：班级端不再有「+ 新增奖品」按钮（奖品统一由教师端录入） */
+    bindPrizeCopy();   /* 📋 班级端仍能复制奖品池，方便发给个人端导入 */
   }
   if(isPersonal()){
     /* 📥 个人端导入奖品池 */
@@ -6449,6 +6454,8 @@ function bindPrize(){
   }
 }
 function openPrizeEditModal(){
+  /* R26e：只有教师端能录入/编辑奖品（班级端只读）。此处是兜底锁，防止旧缓存或其他入口绕过 */
+  if(!isTeacher())return alertModal('仅教师端可录入','奖品只能由教师端录入，班级端只可查看。');
   openModal(`<h3><span>新增奖品</span><button class="close">X</button></h3>
     <div class="field"><label>奖品名称</label><input id="pz-name" placeholder="如：解压奶茶一杯"></div>
     <div class="field"><label>所需积分</label><input type="number" id="pz-cost" value="10" min="1"></div>
