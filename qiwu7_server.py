@@ -1,331 +1,539 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Qiwu7 authenticated sync server, standard library only.
+Private state and password hashes live outside the web root. No legacy token API.
 """
-栖梧7班班级管理系统 · 校园网同步服务端（Python 版 · R24 每设备数据槽）
+import copy
+import datetime as dt
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+from pathlib import Path
+import secrets
+import shutil
+import ssl
+import sys
+import threading
+import time
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+from qiwu7_security import Denied, ZONE, date_now, identifier, number, read_view, reverse_delta, schema, scoring_key, text
 
-零第三方依赖：只用 Python 标准库。Windows / Linux / macOS 通用。
-Python 3.6+ 即可（Windows 上装 Python 时记得勾选 "Add Python to PATH"）。
-
-做什么：
-  1) 托管主程序网页（浏览器打开 http://服务器IP:端口 就能用）
-  2) 提供 /api/sync 接口，把每个设备的数据存成独立「数据槽」
-     —— 教师端 / 班级端 / 个人端各写各的槽，读的时候把所有槽合并，
-       任何一台设备都不可能覆盖别人刚写的数据（R24 之前是整包替换，
-       学生端一同步就可能把教师端推的名单/成绩冲掉，现已根治）
-
-数据文件：本脚本同目录 qiwu7_data/data.json（自动创建，自动留 10 份历史备份）
-"""
-import json, os, sys, time, shutil, threading
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote
-
-# ============ 配置 ============
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get('QIWU7_PORT', '8080'))
-TOKEN = os.environ.get('QIWU7_TOKEN', 'qiwu7')      # 班级口令，务必改成自己的
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'qiwu7_data')
-DATA_FILE = os.path.join(DATA_DIR, 'data.json')
-BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
-MAX_BACKUPS = 10
-SLOT_IDLE_PRUNE_MS = 180 * 24 * 3600 * 1000   # 数据槽闲置超过 180 天才允许清理（避免暑假误删）
-LOCK = threading.Lock()
-
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
-
-
-def log(msg):
-    print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
-
-
-def empty_slots():
-    return {'rev': 0, 'ts': 0, 'slots': {}}
-
-
-def migrate(d):
-    """旧版（整包 payload）数据文件 → 每设备数据槽结构；迁移是幂等的"""
-    if not isinstance(d, dict):
-        return empty_slots()
-    if isinstance(d.get('slots'), dict):
-        d.setdefault('rev', 0)
-        d.setdefault('ts', 0)
-        return d
-    if d.get('payload') is not None:
-        # R23 及更早的整包存档：包成名为 legacy 的槽，新客户端合并时会自然吸收
-        ts = d.get('ts') or int(time.time() * 1000)
-        return {'rev': d.get('rev', 0), 'ts': ts,
-                'slots': {'legacy': {'rev': d.get('rev', 0), 'ts': ts, 'payload': d['payload']}}}
-    return empty_slots()
+BASE = Path(__file__).resolve().parent
+PRIVATE = Path(os.environ.get('QIWU7_PRIVATE_DIR', str(BASE.parent / 'qiwu7_private')))
+PORT = int(sys.argv[1]) if __name__=='__main__' and len(sys.argv)>1 else int(os.environ.get('QIWU7_PORT','18090'))
+LOCK = threading.RLock()
+SESSIONS = {}
+ATTEMPTS = {}
+WRITES = {}
+AUTH_WORKERS = threading.BoundedSemaphore(4)
+TLS_CERT = os.environ.get('QIWU7_TLS_CERT', '')
+TLS_KEY = os.environ.get('QIWU7_TLS_KEY', '')
+TRUST_PROXY = os.environ.get('QIWU7_TRUST_LOOPBACK_PROXY') == '1'
+REQUIRE_TLS = os.environ.get('QIWU7_REQUIRE_TLS') == '1'
+MAX_STATE = 32*1024*1024
+MAX_ARCHIVE = int(os.environ.get('QIWU7_ARCHIVE_MB', '256'))*1024*1024
+MAX_AUDIT = 32*1024*1024
+MAX_BODY = 16*1024*1024
+COOKIE = 'qiwu7_session_v3'
+ARRAYS = ['records','attendanceRemarks','studentFeedbacks','prizes','prizeOrders','nominations','praises','studyLog']
+TOMBS = {'tomb':'records','prizeTomb':'prizes','orderTomb':'prizeOrders','praiseTomb':'praises'}
 
 
-def read_data():
-    """读取服务器上的数据；没有就返回空包（rev=0）。旧格式自动迁移。"""
-    if not os.path.exists(DATA_FILE):
-        return empty_slots()
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            d = json.load(f)
-        return migrate(d)
-    except Exception as e:
-        log('数据文件损坏：%s —— 自动回退到最近一份备份' % e)
-        restore_latest_backup()
-        return empty_slots()
+def now():return int(time.time()*1000)
+def encode(obj):return json.dumps(obj,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode()
+def load_json(name):return json.loads((PRIVATE/name).read_text())
+def atomic(name,obj):
+    path=PRIVATE/name;tmp=path.with_suffix(path.suffix+'.tmp')
+    with open(tmp,'wb') as f:
+        os.chmod(tmp,0o600);f.write(encode(obj));f.flush();os.fsync(f.fileno())
+    os.replace(tmp,path)
+def audit(event,**fields):
+    with LOCK:
+        path=PRIVATE/'audit.jsonl'
+        if path.exists() and path.stat().st_size>=MAX_AUDIT:return
+        with open(PRIVATE/'audit.jsonl','ab') as f:f.write(encode({'ts':now(),'event':event,**fields})+b'\n')
+def hash_password(password,salt=None):
+    salt=salt or secrets.token_hex(16)
+    return {'salt':salt,'hash':hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),260000).hex()}
+def valid_password(password,user):
+    digest=hash_password(password,user['salt'])['hash']
+    return hmac.compare_digest(digest,user['hash'])
+def public_identity(s):return {k:s.get(k,'') for k in ['role','sid','name','account','mustChange']}
 
+class Conflict(Exception):pass
+class Capacity(Exception):pass
+class Limited(Exception):pass
 
-def backup_current():
-    """写入前把现有文件复制一份到 backups/，只保留最近 MAX_BACKUPS 份"""
-    if not os.path.exists(DATA_FILE):
-        return
-    name = 'data-%s.json' % time.strftime('%Y%m%d-%H%M%S')
-    try:
-        shutil.copy2(DATA_FILE, os.path.join(BACKUP_DIR, name))
-    except Exception as e:
-        log('备份失败：%s' % e)
-        return
-    try:
-        bks = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith('data-')])
-        while len(bks) > MAX_BACKUPS:
-            os.remove(os.path.join(BACKUP_DIR, bks.pop(0)))
-    except Exception:
-        pass
+def throttle(account, limit=20, window=60):
+    stamp=time.time();key=(account,window)
+    entries=[t for t in WRITES.get(key,[]) if stamp-t<window]
+    if len(entries)>=limit:raise Limited('操作过于频繁，请稍后再试')
+    WRITES[key]=entries+[stamp]
 
+def commit(candidate,s,ip):
+    """Full periodic snapshots plus per-write reverse deltas; never delete old evidence."""
+    global CURRENT
+    if candidate==CURRENT:return
+    candidate['rev']=CURRENT['rev']+1;candidate['ts']=now()
+    encoded=encode(candidate)
+    if len(encoded)>MAX_STATE:raise Capacity('数据容量已达上限，请联系老师归档；暂未保存')
+    backup=PRIVATE/'backups';backup.mkdir(mode=0o700,exist_ok=True)
+    snapshots=list(backup.glob('state-*.json'))
+    last=max((p.stat().st_mtime for p in snapshots),default=0)
+    delta=encode(reverse_delta(CURRENT,candidate))
+    snapshot=encode(CURRENT) if time.time()-last>=600 else None
+    size=sum(p.stat().st_size for p in backup.iterdir() if p.is_file())
+    if size+len(delta)+(len(snapshot) if snapshot else 0)>MAX_ARCHIVE or shutil.disk_usage(PRIVATE).free<len(encoded)*2+32*1024*1024:
+        raise Capacity('存储空间不足，已暂停写入，请联系老师归档备份')
+    log=PRIVATE/'audit.jsonl'
+    if log.exists() and log.stat().st_size>=MAX_AUDIT:raise Capacity('审计空间已满，已暂停写入，请联系老师归档')
+    old_hash=hashlib.sha256(encode(CURRENT)).hexdigest()
+    for prefix,content in [('delta',delta),('state',snapshot)]:
+        if content is None:continue
+        path=backup/('%s-%s-%s.json'%(prefix,CURRENT['rev'],now()))
+        with open(path,'xb') as f:
+            os.chmod(path,0o600);f.write(content);f.flush();os.fsync(f.fileno())
+    changed=[k for k in ['master','shared'] if candidate[k]!=CURRENT[k]]
+    atomic('state.json',candidate);CURRENT=candidate
+    audit('sync',account=s['account'],role=s['role'],sid=s.get('sid'),ip=ip,rev=CURRENT['rev'],changed=changed,before=old_hash,after=hashlib.sha256(encoded).hexdigest())
 
-def restore_latest_backup():
-    try:
-        bks = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith('data-')])
-        if not bks:
-            return False
-        shutil.copy2(os.path.join(BACKUP_DIR, bks[-1]), DATA_FILE)
-        log('已恢复备份：%s' % bks[-1])
-        return True
-    except Exception:
+class BoundedServer(ThreadingHTTPServer):
+    daemon_threads=True
+    def __init__(self,*args,**kwargs):
+        self.slots=threading.BoundedSemaphore(40)
+        super().__init__(*args,**kwargs)
+    def get_request(self):
+        conn,addr=super().get_request();conn.settimeout(10)
+        if getattr(self,'tls_context',None):
+            conn=self.tls_context.wrap_socket(conn,server_side=True,do_handshake_on_connect=False)
+        return conn,addr
+    def process_request(self,request,client_address):
+        if not self.slots.acquire(blocking=False):self.shutdown_request(request);return
+        try:super().process_request(request,client_address)
+        except BaseException:self.slots.release();raise
+    def process_request_thread(self,*args):
+        try:super().process_request_thread(*args)
+        finally:self.slots.release()
+
+def check_json(value,depth=0):
+    if depth>24:raise Denied('数据嵌套过深')
+    if isinstance(value,dict):
+        if len(value)>30000:raise Denied('数据过多')
+        for key,item in value.items():
+            if not isinstance(key,str) or key in ['__proto__','constructor','prototype']:raise Denied('非法字段')
+            check_json(item,depth+1)
+    elif isinstance(value,list):
+        if len(value)>30000:raise Denied('数据过多')
+        for item in value:check_json(item,depth+1)
+    elif isinstance(value,str):
+        if len(value)>500000:raise Denied('文本过长')
+    elif isinstance(value,float) and not math.isfinite(value):raise Denied('数值无效')
+
+def permissions(master,s):
+    stu=next((x for x in master['students'] if x['id']==s.get('sid')),None)
+    if not stu:raise Denied('学生不在当前名单')
+    role=stu.get('role','');name=stu['name']
+    full=name in ['张喆祎','黎科麟','周雨轩'] or '班长' in role or '学习委员' in role
+    return stu,{'full':full,'homework':full or '课代表' in role or '组长' in role,'answer':full or '课代表' in role or '组长' in role,'health':name=='张涵' or '卫生委员' in role}
+
+def validate_student_item(key,item,s,master,perm,stu):
+    sid=s['sid'];name=stu['name'];ids={x['id'] for x in master['students']}
+    if key=='records':
+        amount=item.get('amount');cat=item.get('cat');kind=item.get('type')
+        if item.get('studentId') not in ids or kind not in ['bonus','deduct'] or not isinstance(amount,(int,float)) or isinstance(amount,bool) or not 0<amount<=20:raise Denied('积分记录无效')
+        allowed=perm['full'] or (cat=='作业' and kind=='bonus' and amount==1 and perm['homework']) or (cat=='回答问题' and kind=='bonus' and amount in [1,3] and perm['answer']) or (cat=='班级卫生' and kind=='deduct' and perm['health'])
+        if not allowed:raise Denied('没有登记此类积分的权限')
+        item['operator']=name;item['source']='personal';item['actorSid']=sid
+    elif key=='studentFeedbacks':
+        text(item.get('text'),2000,True)
+        if item.get('name')!=name or item.get('read'):raise Denied('只能提交本人的未读反馈')
+        item['sid']=sid;item['studentId']=sid;item['read']=False;item['source']='personal'
+    elif key=='attendanceRemarks':
+        if item.get('studentId')!=sid or item.get('status')!='pending':raise Denied('只能提交本人的待审核考勤说明')
+        text(item.get('text'),2000,True)
+        if item.get('date')!=date_now().isoformat() or item.get('session') not in [x['id'] for x in master.get('settings',{}).get('sessions',[])]:raise Denied('考勤说明日期或时段无效')
+    elif key=='studyLog':
+        raise Denied('学习时长由服务器计时，请使用开始、暂停和结束按钮')
+    elif key=='prizeOrders':
+        prize=next((p for p in CURRENT['shared'].get('prizes',[]) if p.get('id')==item.get('prizeId')),None)
+        if item.get('sid')!=sid or item.get('name')!=name or item.get('status')!='pending' or not prize or prize.get('active') is False or item.get('cost')!=prize.get('cost') or item.get('statusTs',0)!=0:raise Denied('兑换申请无效')
+        number(item['cost'],0.01)
+        item['prizeName']=prize.get('name','')
+    elif key=='nominations':
+        amount=item.get('amount')
+        if item.get('sid')!=sid or item.get('name')!=name or item.get('status')!='pending' or item.get('recordId') or item.get('approvedAmount') is not None or item.get('statusTs',0)!=0 or type(amount) not in (int,float) or not 1<=amount<=5:raise Denied('加分申请无效')
+        text(item.get('what'),2000,True);text(item.get('why'),2000,True)
+    elif key=='praises':
+        if item.get('fromSid')!=sid or item.get('fromName')!=name or item.get('fromRole')!='personal' or item.get('toSid') not in ids:raise Denied('表扬署名无效')
+        text(item.get('reason'),2000,True)
+        item['toName']=next(x['name'] for x in master['students'] if x['id']==item['toSid'])
+    else:raise Denied('没有修改此类数据的权限')
+    item['ts']=now();item['timeStr']=time.strftime('%Y-%m-%d %H:%M',time.gmtime(time.time()+8*3600))
+
+def merge_shared(existing,incoming,s,master):
+    if not isinstance(incoming,dict) or set(incoming)-set(existing):raise Denied('共享数据字段无效')
+    visible=read_view({'master':master,'shared':existing},s)['shared']
+    if s['role']=='classroom':
+        if any(value!=visible.get(key) for key,value in incoming.items()):raise Denied('一体机为只读展示；登记请使用班干个人账号')
+        return copy.deepcopy(existing)
+    out=copy.deepcopy(existing);priv=s['role']=='teacher'
+    stu,perm=permissions(master,s) if not priv else (None,None)
+    added=0
+    for key in ARRAYS:
+        values=incoming.get(key,visible.get(key,[]))
+        if not isinstance(values,list):raise Denied('列表格式无效')
+        original={x['id']:x for x in existing.get(key,[])}
+        projected={x['id']:x for x in visible.get(key,[])}
+        target={} if priv else {x['id']:x for x in out.get(key,[])}
+        for value in values:
+            if not isinstance(value,dict) or not isinstance(value.get('id'),str) or not 1<=len(value['id'])<=100:raise Denied('记录编号无效')
+            item=copy.deepcopy(value);rid=item['id'];old=original.get(rid)
+            if old==item or (not priv and projected.get(rid)==item):
+                if priv:target[rid]=item
+                continue
+            schema(key,item)
+            if key=='records' and item.get('studentId') not in {x['id'] for x in master['students']}:raise Denied('积分学生无效')
+            if not priv:
+                if old:raise Denied('不能改写已经提交的记录')
+                if key in TOMBS.values() and rid in existing.get(next(k for k,v in TOMBS.items() if v==key),{}):raise Denied('不能重新提交已撤销记录')
+                validate_student_item(key,item,s,master,perm,stu)
+                if key=='records':
+                    item['eventKey']=scoring_key(item,s['sid'])
+                    if any(x.get('eventKey')==item['eventKey'] for x in target.values()):raise Denied('同一登记事项不能重复加扣分')
+                added+=1
+                if added>1000:raise Denied('单次提交记录过多')
+                if key!='records':
+                    today=date_now().isoformat()
+                    count=sum(1 for x in target.values() if x.get('timeStr','').startswith(today) and (x.get('sid')==s['sid'] or x.get('studentId')==s['sid'] or x.get('fromSid')==s['sid']))
+                    if count>=50:raise Limited('今日此类提交已达上限，请联系老师')
+            target[rid]=item
+        out[key]=list(target.values())
+    for key,field in TOMBS.items():
+        values=incoming.get(key,{})
+        if not isinstance(values,dict):raise Denied('删除标记无效')
+        for rid,ts in values.items():
+            if visible.get(key,{}).get(rid)==ts:continue
+            if not isinstance(ts,(float,int)) or isinstance(ts,bool):raise Denied('删除时间无效')
+            if not priv:
+                obj=next((x for x in out[field] if x['id']==rid),None)
+                if key=='orderTomb':allowed=obj and obj.get('sid')==s['sid'] and obj.get('status')=='pending'
+                elif key=='tomb':allowed=obj and obj.get('actorSid')==s['sid'] and obj.get('ts',0)>=s['created']*1000
+                else:allowed=False
+                if not allowed:raise Denied('没有撤销此记录的权限')
+            out.setdefault(key,{})[rid]=now()
+        out[field]=[x for x in out[field] if x['id'] not in out.get(key,{})]
+    att=incoming.get('attendance',{})
+    if not isinstance(att,dict):raise Denied('考勤格式无效')
+    for date,day in att.items():
+        if not isinstance(day,dict):raise Denied('考勤格式无效')
+        for sess,entries in day.items():
+            if not isinstance(entries,dict):raise Denied('考勤格式无效')
+            target=out.setdefault('attendance',{}).setdefault(date,{}).setdefault(sess,{})
+            for sid,value in entries.items():
+                if not isinstance(value,dict):raise Denied('考勤记录无效')
+                if value==target.get(sid):continue
+                if not priv:
+                    today=time.strftime('%Y-%m-%d',time.gmtime(time.time()+8*3600))
+                    session=next((x for x in master.get('settings',{}).get('sessions',[]) if x.get('id')==sess),None)
+                    if sid!=s['sid'] or date!=today or not session:raise Denied('只能登记本人今天的到班记录')
+                    arrival=time.strftime('%H:%M',time.gmtime(time.time()+8*3600))
+                    value={'time':arrival,'status':'ok' if arrival<=session.get('deadline','00:00') else 'late','ts':now()}
+                target[sid]=value
+    ats=incoming.get('attTomb',{})
+    if not isinstance(ats,dict):raise Denied('考勤删除标记无效')
+    if not priv and ats!=visible.get('attTomb',{}):raise Denied('没有删除考勤的权限')
+    if priv:
+        for key,ts in ats.items():
+            if out.get('attTomb',{}).get(key)!=ts:out.setdefault('attTomb',{})[key]=now()
+        for key in out.get('attTomb',{}):
+            parts=key.split('|')
+            if len(parts)==3:out.get('attendance',{}).get(parts[0],{}).get(parts[1],{}).pop(parts[2],None)
+    return out
+
+def study_public(s):
+    if s['role']!='personal':return None
+    active=STUDY.get(s.get('sid'))
+    if not active:return None
+    return {k:active[k] for k in ['id','mode','startTs','accMs','pausedAt']}
+
+def study_action(obj,s,ip):
+    if s['role']!='personal':raise Denied('仅个人端可计时')
+    permissions(CURRENT['master'],s)
+    sid=s['sid'];active=copy.deepcopy(STUDY.get(sid));stamp=now();action=obj.get('action')
+    if action not in ['start','pause','resume','stop']:raise Denied('计时操作无效')
+    if action=='start':
+        if active:return study_public(s)
+        mode=obj.get('mode','free')
+        if mode not in ['free','pomo']:raise Denied('计时模式无效')
+        active={'id':secrets.token_hex(16),'mode':mode,'startTs':stamp,'accMs':0,'pausedAt':0,'segments':[]}
+    else:
+        if not active:
+            if action=='stop':return None  # Retried completion cannot create another row.
+            raise Denied('计时已结束，请重新开始')
+        if obj.get('id')!=active['id']:raise Denied('计时已变化，请刷新页面')
+        if action in ['pause','stop'] and not active['pausedAt']:
+            # A server timer establishes elapsed wall time, not proof of attention.
+            end=min(stamp,active['startTs']+24*3600*1000)
+            active['segments'].append([active['startTs'],end]);active['accMs']+=end-active['startTs'];active['pausedAt']=stamp
+        if action=='resume' and active['pausedAt']:
+            active['startTs']=stamp;active['pausedAt']=0
+        if len(active['segments'])>200:raise Denied('分段过多，请结束本段后重新开始')
+        if action=='stop':
+            daily={}
+            for start,end in active['segments']:
+                while start<end:
+                    day=dt.datetime.fromtimestamp(start/1000,ZONE).date()
+                    midnight=int(dt.datetime.combine(day+dt.timedelta(days=1),dt.time(),ZONE).timestamp()*1000)
+                    edge=min(midnight,end);key=day.isoformat()
+                    row=daily.setdefault(key,{'start':start,'end':edge,'ms':0});row['end']=edge;row['ms']+=edge-start;start=edge
+            candidate=copy.deepcopy(CURRENT)
+            rows=candidate['shared']['studyLog'];ids={x['id'] for x in rows}
+            for date,segment in daily.items():
+                rid=active['id']+'_'+date
+                if rid in ids:continue
+                duration=segment['ms']//60000
+                used=sum(x.get('dur',0) for x in rows if x.get('sid')==sid and x.get('date')==date)
+                duration=min(duration,max(0,1440-used))
+                if not duration:continue
+                rows.append({'id':rid,'sid':sid,'date':date,'startTs':segment['start'],'endTs':segment['end'],
+                             'dur':duration,'mode':active['mode'],'ts':stamp,'verified':'server-elapsed'})
+            commit(candidate,s,ip)
+            # If persisting runtime fails, retry sees the same IDs and cannot double count.
+            updated=copy.deepcopy(STUDY);updated.pop(sid,None);atomic('study.json',updated);STUDY.clear();STUDY.update(updated)
+            return None
+    updated=copy.deepcopy(STUDY);updated[sid]=active;atomic('study.json',updated);STUDY.clear();STUDY.update(updated)
+    return study_public(s)
+
+LOGIN_HTML='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>栖梧7班 · 安全登录</title><style>body{font:16px system-ui;background:#f2f5f8;margin:0;padding:8vh 20px}main{max-width:380px;margin:auto;background:white;padding:28px;border-radius:18px}input,select,button{box-sizing:border-box;width:100%;padding:12px;margin:8px 0;border:1px solid #bfc9d4;border-radius:8px;font:inherit}button{background:#2359b8;color:white}#msg{color:#b3261e}</style><main><h2>栖梧7班 · 登录</h2><p>系统已完成安全升级，请使用老师发放的新密码。班级一体机由老师授权登录。</p><form id="f"><label>入口<select id="role"><option value="personal">学生个人端</option><option value="teacher">教师端</option><option value="classroom">班级一体机（教师授权）</option></select></label><label>账号<input id="u" autocomplete="username" required></label><label>密码<input id="p" type="password" autocomplete="current-password" required></label><button>登录</button></form><p id="msg" role="alert"></p></main><script>document.getElementById('f').onsubmit=async e=>{e.preventDefault();const msg=document.getElementById('msg');msg.textContent='正在登录…';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:document.getElementById('role').value,account:document.getElementById('u').value,password:document.getElementById('p').value})});const d=await r.json();if(!r.ok)throw Error(d.error||'登录失败');location.replace(d.mustChange?'/account':'/')}catch(e){msg.textContent=e.message}};</script></html>'''
+ACCOUNT_HTML='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>修改密码</title><style>body{font:16px system-ui;max-width:420px;margin:8vh auto;padding:20px}input,button{width:100%;box-sizing:border-box;padding:12px;margin:10px 0;font:inherit}#msg{color:#b3261e}</style><h2>设置新密码</h2><p>首次登录请更换临时密码。新密码至少 12 位，请勿使用身份证信息。</p><form id="f"><input id="old" type="password" placeholder="当前密码" autocomplete="current-password" required><input id="new" type="password" placeholder="新密码（至少12位）" minlength="12" autocomplete="new-password" required><input id="confirm" type="password" placeholder="再次输入新密码" autocomplete="new-password" required><button>保存并进入系统</button></form><p id="msg" role="alert"></p><script>__BOOT__
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const msg=document.getElementById('msg');try{const p=document.getElementById('new').value;if(p!==document.getElementById('confirm').value)throw Error('两次新密码不一致');const r=await fetch('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/json','X-Qiwu7-CSRF':window.__QIWU7_BOOT__.csrf},body:JSON.stringify({current:document.getElementById('old').value,password:p})});const d=await r.json();if(!r.ok)throw Error(d.error||'保存失败');location.replace('/')}catch(e){msg.textContent=e.message}};</script></html>'''
+
+class Handler(BaseHTTPRequestHandler):
+    server_version='Qiwu7/3'
+    def log_message(self,*args):pass  # Never log URLs, passwords or cookies.
+    def encrypted(self):
+        return isinstance(self.connection,ssl.SSLSocket) or (TRUST_PROXY and self.client_address[0] in ['127.0.0.1','::1'] and self.headers.get('X-Forwarded-Proto')=='https')
+    def transport_allowed(self):
+        host=urlsplit('//'+self.headers.get('Host','')).hostname
+        return self.encrypted() or (self.client_address[0] in ['127.0.0.1','::1'] and host in ['localhost','127.0.0.1','::1'])
+    def require_transport(self):
+        if not REQUIRE_TLS or self.transport_allowed():return True
+        self.send({'ok':False,'error':'为保护密码和班级数据，请使用受信任的 HTTPS 入口'},426)
         return False
-
-
-def write_file(d):
-    """原子落盘：先写临时文件再替换，断电也不会写坏"""
-    backup_current()
-    d['ts'] = int(time.time() * 1000)
-    tmp = DATA_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, DATA_FILE)
-
-
-def prune_slots(d, keep_dev=None):
-    """清理闲置超过 180 天的数据槽（刚写入的槽除外；只剩一个槽时不清）"""
-    now = int(time.time() * 1000)
-    slots = d.get('slots') or {}
-    stale = [dev for dev, s in slots.items()
-             if dev != keep_dev and now - (s.get('ts') or 0) > SLOT_IDLE_PRUNE_MS]
-    if stale and len(slots) - len(stale) >= 1:
-        for dev in stale:
-            del slots[dev]
-        log('已清理 %d 个闲置数据槽：%s' % (len(stale), ', '.join(stale)))
-
-
-def write_slot(payload, dev, base_rev):
-    """
-    写入某个设备自己的数据槽（槽级乐观锁）：
-      - base_rev 与该槽当前 rev 不一致 → 拒绝（409），客户端重新拉取合并后再试
-      - 一致 → 写入，该槽 rev+1，全局 rev+1
-    各设备写各的槽，互相之间永远不会冲突。
-    """
-    with LOCK:
-        d = read_data()
-        slots = d.setdefault('slots', {})
-        cur = slots.get(dev) or {'rev': 0, 'ts': 0, 'payload': None}
-        if base_rev is not None and cur.get('rev', 0) != base_rev:
-            return {'ok': False, 'conflict': True, 'rev': d.get('rev', 0),
-                    'slotRev': cur.get('rev', 0), 'payload': cur.get('payload')}
-        d['rev'] = d.get('rev', 0) + 1
-        slots[dev] = {'rev': d['rev'], 'ts': int(time.time() * 1000), 'payload': payload}
-        prune_slots(d, keep_dev=dev)
-        write_file(d)
-        return {'ok': True, 'rev': d['rev'], 'ts': d['ts'], 'slotRev': slots[dev]['rev']}
-
-
-def write_legacy(payload, base_rev):
-    """兼容 R23 旧客户端：整包替换（保留旧语义，便于混合升级期间过渡）"""
-    with LOCK:
-        d = read_data()
-        if base_rev is not None and d.get('rev', 0) != base_rev:
-            return {'ok': False, 'conflict': True, 'rev': d.get('rev', 0),
-                    'payload': {'slots': d.get('slots')}}
-        d['rev'] = d.get('rev', 0) + 1
-        d['slots'] = {'legacy': {'rev': d['rev'], 'ts': int(time.time() * 1000), 'payload': payload}}
-        write_file(d)
-        return {'ok': True, 'rev': d['rev'], 'ts': d['ts']}
-
-
-class Handler(SimpleHTTPRequestHandler):
-    """静态文件 + 同步接口"""
-
-    def _send_json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _check_token(self, q):
-        return q.get('token', [''])[0] == TOKEN
-
-    def do_OPTIONS(self):
-        self._send_json({'ok': True})
-
+    def headers_common(self):
+        self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Referrer-Policy','no-referrer')
+        self.send_header('X-Frame-Options','DENY')
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'nonce-%s'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" % getattr(self,'_nonce','none'))
+        if self.encrypted():self.send_header('Strict-Transport-Security','max-age=31536000')
+    def send(self,body,code=200,ctype='application/json; charset=utf-8',extra=None):
+        if not isinstance(body,bytes):body=encode(body)
+        self.send_response(code);self.headers_common();self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(body)))
+        for key,value in (extra or {}).items():self.send_header(key,value)
+        self.end_headers();self.wfile.write(body)
+    def html(self,body,code=200):
+        self._nonce=secrets.token_urlsafe(24)
+        body=body.replace('<script>','<script nonce="'+self._nonce+'">')
+        self.send(body.encode(),code,'text/html; charset=utf-8')
+    def body(self,limit=MAX_BODY):
+        if self.headers.get('Transfer-Encoding'):raise Denied('不支持分块请求')
+        if self.headers.get('Content-Type','').split(';')[0]!='application/json':raise Denied('仅接受 JSON 请求')
+        try:length=int(self.headers.get('Content-Length','0'))
+        except ValueError:raise Denied('请求长度无效')
+        if not 0<length<=limit:raise Denied('请求长度无效')
+        obj=json.loads(self.rfile.read(length));check_json(obj)
+        if not isinstance(obj,dict):raise Denied('请求格式无效')
+        return obj
+    def session(self):
+        try:
+            jar=cookies.SimpleCookie();jar.load(self.headers.get('Cookie',''));token=jar[COOKIE].value
+        except (KeyError,cookies.CookieError):return None
+        with LOCK:
+            s=SESSIONS.get(token)
+            if not s or s['expires']<time.time():SESSIONS.pop(token,None);return None
+            # Password rotation revokes other sessions even if a stale cookie survives.
+            user=USERS['users'].get(s['account'])
+            if not user or s['version']!=user.get('version',1):return None
+            return s
+    def same_origin(self):
+        origin=self.headers.get('Origin')
+        host=self.headers.get('Host','')
+        return bool(origin and origin in ['http://'+host,'https://'+host] and host in ALLOWED_HOSTS)
+    def boot(self,s,include_state=False):
+        boot={**public_identity(s),'csrf':s['csrf'],'epoch':CURRENT['epoch']}
+        if include_state:boot.update({'rev':CURRENT['rev'],'initial':read_view(CURRENT,s),'study':study_public(s)})
+        return 'window.__QIWU7_BOOT__='+encode(boot).decode().replace('<','\\u003c')+';'
     def do_GET(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-
-        if u.path == '/api/ping':
-            return self._send_json({'ok': True, 'name': 'qiwu7', 'rev': read_data()['rev'],
-                                    'time': time.strftime('%Y-%m-%d %H:%M:%S')})
-
-        if u.path == '/api/sync':
-            if not self._check_token(q):
-                return self._send_json({'ok': False, 'error': '口令不对'}, 401)
-            d = read_data()
-            slots = d.get('slots') or {}
-            # 客户端带上各槽已知版本号（revs={设备id:版本}）→ 只回传有变化的槽，省带宽
-            revs = {}
-            raw_revs = q.get('revs', [''])[0]
-            if raw_revs:
-                try:
-                    revs = json.loads(raw_revs)
-                    if not isinstance(revs, dict):
-                        revs = {}
-                except Exception:
-                    revs = {}
-            if revs:
-                changed = {dev: s for dev, s in slots.items()
-                           if not (dev in revs and revs[dev] == s.get('rev'))}
-            else:
-                changed = slots
-            return self._send_json({'ok': True, 'rev': d['rev'], 'ts': d['ts'], 'slots': changed,
-                                    'count': len(slots),
-                                    'slotsRev': {dev: s.get('rev', 0) for dev, s in slots.items()}})
-
-        if u.path == '/api/backup':
-            if not self._check_token(q):
-                return self._send_json({'ok': False, 'error': '口令不对'}, 401)
-            d = read_data()
-            body = json.dumps(d, ensure_ascii=False).encode('utf-8')
-            fn = '栖梧7班数据备份-%s.json' % time.strftime('%Y%m%d-%H%M')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            # HTTP 头只能装 ASCII：中文文件名必须按 RFC 5987 百分号编码，否则 send_header 抛 UnicodeEncodeError
-            self.send_header('Content-Disposition', 'attachment; filename*=UTF-8\'\'%s' % quote(fn))
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        # 其余走静态文件
-        return SimpleHTTPRequestHandler.do_GET(self)
-
+        path=urlsplit(self.path).path
+        if self.headers.get('Host','') not in ALLOWED_HOSTS:return self.send({'ok':False},403)
+        s=self.session()
+        if path=='/api/ping':return self.send({'ok':True,'name':'qiwu7','securityVersion':3})
+        if not self.require_transport():return
+        if path in ['/','/index.html','/login']:
+            if not s:return self.html(LOGIN_HTML)
+            if s['mustChange']:return self.send(b'',303,extra={'Location':'/account'})
+            with LOCK:
+                html=(BASE/'index.html').read_text();html=html.replace('<head>','<head><script>'+self.boot(s,True)+'</script>',1)
+            return self.html(html)
+        if path=='/account':
+            if not s:return self.send(b'',303,extra={'Location':'/'})
+            return self.html(ACCOUNT_HTML.replace('__BOOT__',self.boot(s)))
+        if path=='/api/auth/session':
+            if not s:return self.send({'ok':False,'error':'请重新登录'},401)
+            return self.send({'ok':True,**public_identity(s),'csrf':s['csrf'],'epoch':CURRENT['epoch']})
+        if path=='/api/study':
+            if not s or s['mustChange'] or s['role']!='personal':return self.send({'ok':False},403)
+            with LOCK:result={'ok':True,'study':study_public(s)}
+            return self.send(result)
+        if path in ['/api/sync','/api/backup']:
+            if not s:return self.send({'ok':False,'error':'请刷新页面并使用新密码登录'},401)
+            if s['mustChange']:return self.send({'ok':False,'error':'请先修改临时密码'},403)
+            if path=='/api/backup':
+                if s['role']!='teacher':return self.send({'ok':False,'error':'仅教师可备份'},403)
+                with LOCK:result=encode(CURRENT)
+                return self.send(result,extra={'Content-Disposition':'attachment; filename="qiwu7-backup.json"'})
+            with LOCK:
+                payload={'app':'qiwu7-sync','ver':28,**read_view(CURRENT,s)}
+                result={'ok':True,'rev':CURRENT['rev'],'ts':CURRENT['ts'],'epoch':CURRENT['epoch'],'slots':{'authoritative':{'rev':CURRENT['rev'],'ts':CURRENT['ts'],'payload':payload}},'slotsRev':{'authoritative':CURRENT['rev']},'count':1}
+            return self.send(result)
+        return self.send({'ok':False,'error':'not found'},404)
+    def do_OPTIONS(self):self.send({'ok':False},405)
     def do_POST(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-
-        if u.path != '/api/sync':
-            return self._send_json({'ok': False, 'error': 'not found'}, 404)
-
-        if not self._check_token(q):
-            return self._send_json({'ok': False, 'error': '口令不对'}, 401)
-
+        global CURRENT
+        path=urlsplit(self.path).path
+        if self.headers.get('Host','') not in ALLOWED_HOSTS or not self.same_origin():return self.send({'ok':False,'error':'请求来源不被允许'},403)
+        if not self.require_transport():return
         try:
-            length = int(self.headers.get('Content-Length') or 0)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length).decode('utf-8') if length else ''
-        try:
-            req = json.loads(raw) if raw else {}
+            if path=='/api/auth/login':return self.login(self.body(4096))
+            s=self.session()
+            if not s:return self.send({'ok':False,'error':'请刷新页面并登录'},401)
+            if not hmac.compare_digest(str(self.headers.get('X-Qiwu7-CSRF','')),s['csrf']):raise Denied('请刷新页面后重试')
+            obj=self.body()
+            if path=='/api/auth/logout':
+                with LOCK:
+                    for token,value in list(SESSIONS.items()):
+                        if value is s:del SESSIONS[token]
+                return self.send({'ok':True},extra={'Clear-Site-Data':'"cache", "cookies", "storage"','Set-Cookie':COOKIE+'=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'+('; Secure' if self.encrypted() else '')})
+            if path=='/api/auth/password':return self.password(obj,s)
+            if s['mustChange']:raise Denied('请先修改临时密码')
+            if path=='/api/study':
+                with LOCK:
+                    throttle(s['account'],30)
+                    result=study_action(obj,s,self.client_address[0])
+                return self.send({'ok':True,'study':result,'rev':CURRENT['rev']})
+            if path!='/api/sync':return self.send({'ok':False},404)
+            with LOCK:
+                throttle(s['account'],60 if s['role']=='teacher' else 20)
+                if obj.get('epoch')!=CURRENT['epoch']:raise Denied('旧版数据已停用，请刷新页面重新登录')
+                if obj.get('baseRev')!=CURRENT['rev']:raise Conflict()
+                payload=obj.get('payload')
+                if not isinstance(payload,dict):raise Denied('同步格式无效')
+                if payload.get('role')!=s['role']:raise Denied('会话角色与提交角色不一致')
+                candidate=copy.deepcopy(CURRENT)
+                if 'master' in payload:
+                    if s['role']!='teacher':raise Denied('仅教师可以修改名单、条例和成绩')
+                    m=copy.deepcopy(payload['master'])
+                    if not isinstance(m,dict) or set(m)!=set(CURRENT['master']):raise Denied('教师数据字段无效')
+                    if not isinstance(m.get('students'),list) or not 1<=len(m['students'])<=200:raise Denied('名单格式无效')
+                    ids=[]
+                    for student in m['students']:
+                        if not isinstance(student,dict) or not isinstance(student.get('id'),str) or not isinstance(student.get('name'),str) or not 1<=len(student['name'])<=40:raise Denied('学生信息无效')
+                        identifier(student['id'])
+                        ids.append(student['id'])
+                    if len(set(ids))!=len(ids):raise Denied('学生编号重复')
+                    if not isinstance(m.get('settings'),dict) or not isinstance(m.get('exams'),list) or not isinstance(m.get('rulesBlocks'),list):raise Denied('教师数据格式无效')
+                    m['settings']['cloud']={'on':True,'url':'','token':''}
+                    m['ts']=CURRENT['master']['ts']
+                    if (m.get('rulesBlocks'),m.get('rulesContent'))!=(CURRENT['master'].get('rulesBlocks'),CURRENT['master'].get('rulesContent')):m['rulesUpdatedAt']=now()
+                    else:m['rulesUpdatedAt']=CURRENT['master']['rulesUpdatedAt']
+                    if m!=CURRENT['master']:m['ts']=now()
+                    candidate['master']=m
+                candidate['shared']=merge_shared(CURRENT['shared'],payload.get('shared',{}),s,candidate['master'])
+                commit(candidate,s,self.client_address[0])
+                result={'ok':True,'rev':CURRENT['rev'],'ts':CURRENT['ts'],'slotRev':CURRENT['rev']}
+            return self.send(result)
+        except Conflict:return self.send({'ok':False,'conflict':True,'rev':CURRENT['rev'],'error':'有新数据，请合并后重试'},409)
+        except Limited as e:return self.send({'ok':False,'error':str(e)},429)
+        except Capacity as e:return self.send({'ok':False,'error':str(e)},507)
+        except (Denied,ValueError,TypeError,KeyError) as e:
+            audit('rejected',path=path,ip=self.client_address[0],reason=str(e)[:160])
+            return self.send({'ok':False,'error':str(e)[:160]},403 if isinstance(e,Denied) else 400)
         except Exception as e:
-            return self._send_json({'ok': False, 'error': '请求不是合法 JSON：%s' % e}, 400)
-
-        payload = req.get('payload')
-        base_rev = req.get('baseRev')
-        if payload is None:
-            return self._send_json({'ok': False, 'error': '缺少 payload'}, 400)
-
-        dev = req.get('deviceId')
-        if dev is not None:
-            # R24 新协议：写自己的数据槽
-            dev = str(dev)[:64] or 'unknown'
-            r = write_slot(payload, dev, base_rev)
-        else:
-            # 旧协议：整包替换（兼容升级过渡期的旧客户端）
-            r = write_legacy(payload, base_rev)
-
-        if not r.get('ok'):
-            # 冲突：把服务器最新版本一起返回，客户端合并后重试
-            return self._send_json({'ok': False, 'conflict': True, 'rev': r.get('rev', 0),
-                                    'slotRev': r.get('slotRev'),
-                                    'payload': r.get('payload'),
-                                    'slots': r.get('payload', {}).get('slots') if isinstance(r.get('payload'), dict) else None,
-                                    'error': '数据已被其他设备更新，请合并后重试'}, 409)
-        log('已同步 rev=%s（%s，来自 %s）' % (r['rev'], dev or 'legacy', self.client_address[0]))
-        return self._send_json({'ok': True, 'rev': r['rev'], 'ts': r['ts'], 'slotRev': r.get('slotRev')})
-
-    def log_message(self, fmt, *args):
-        # 只在出错时打印，避免刷屏
-        if '404' in (fmt % args) or '500' in (fmt % args):
-            log(fmt % args)
-
+            audit('server_error',path=path,error=type(e).__name__)
+            return self.send({'ok':False,'error':'服务器处理失败，数据未确认保存，请联系老师'},500)
+    def login(self,obj):
+        account=str(obj.get('account','')).strip().lower();role=obj.get('role');password=obj.get('password','')
+        if not 1<=len(account)<=64 or role not in ['teacher','classroom','personal'] or not isinstance(password,str) or len(password)>256:raise Denied('账号或密码错误')
+        ip=self.client_address[0];key=(ip,account);stamp=time.time()
+        with LOCK:
+            for attempt_key,entries in list(ATTEMPTS.items()):
+                live=[x for x in entries if stamp-x<900]
+                if live:ATTEMPTS[attempt_key]=live
+                else:ATTEMPTS.pop(attempt_key,None)
+            if len(ATTEMPTS)>10000:raise Limited('请求过于频繁，请稍后重试')
+            times=ATTEMPTS.setdefault(key,[])
+            ip_count=sum(len(v) for (source,_),v in ATTEMPTS.items() if source==ip)
+            account_count=sum(len(v) for (_,name),v in ATTEMPTS.items() if name==account)
+            if len(times)>=8 or ip_count>=80 or account_count>=40:raise Limited('尝试过于频繁，请15分钟后重试')
+            times.append(stamp)  # Reserve before expensive work, including concurrent requests.
+            user=copy.deepcopy(USERS['users'].get(account))
+        correct_role=user and ((role in ['teacher','classroom'] and user['role']=='teacher') or (role=='personal' and user['role']=='personal'))
+        if not AUTH_WORKERS.acquire(blocking=False):raise Limited('登录繁忙，请稍后重试')
+        try:
+            correct=bool(correct_role and valid_password(password,user))
+        finally:AUTH_WORKERS.release()
+        with LOCK:
+            if not correct or user!=USERS['users'].get(account) or user.get('temporaryExpires',float('inf'))<stamp:
+                audit('login_failed',account=account,ip=ip)
+                return self.send({'ok':False,'error':'账号或密码错误，或临时密码已过期'},401)
+            for k,v in list(SESSIONS.items()):
+                if v['expires']<time.time():del SESSIONS[k]
+            if len(SESSIONS)>=1000 or sum(v['account']==account for v in SESSIONS.values())>=10:raise Limited('会话过多，请先退出其他设备')
+            token=secrets.token_urlsafe(32);s={'account':account,'role':role,'sid':user.get('sid',''),'name':user.get('name',''),'csrf':secrets.token_urlsafe(24),'created':time.time(),'expires':time.time()+12*3600,'version':user.get('version',1),'mustChange':user.get('mustChange',False)}
+            SESSIONS[token]=s;audit('login',account=account,role=role,ip=ip)
+            header=COOKIE+'='+token+'; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200'+('; Secure' if self.encrypted() else '')
+            return self.send({'ok':True,**public_identity(s)},extra={'Set-Cookie':header})
+    def password(self,obj,s):
+        password=obj.get('password','');current=obj.get('current','')
+        if not isinstance(password,str) or not 12<=len(password)<=128:raise Denied('新密码需要12—128位')
+        with LOCK:
+            throttle(s['account']+':password',5,900)
+            user=copy.deepcopy(USERS['users'][s['account']])
+        if not isinstance(current,str) or len(current)>256:raise Denied('当前密码错误')
+        if not AUTH_WORKERS.acquire(blocking=False):raise Limited('认证繁忙，请稍后重试')
+        try:
+            if not valid_password(current,user):raise Denied('当前密码错误')
+            if password==current:raise Denied('新密码不能与原密码相同')
+            rotated=hash_password(password)
+        finally:AUTH_WORKERS.release()
+        with LOCK:
+            if user!=USERS['users'][s['account']]:raise Denied('密码已变化，请重新登录')
+            user.update(rotated);user['version']=user.get('version',1)+1;user['mustChange']=False;user.pop('temporaryExpires',None)
+            updated=copy.deepcopy(USERS);updated['users'][s['account']]=user
+            atomic('users.json',updated);USERS.clear();USERS.update(updated);s['version']=user['version'];s['mustChange']=False
+            audit('password_changed',account=s['account'],ip=self.client_address[0])
+            return self.send({'ok':True})
 
 def main():
-    # 静态根目录 = 本脚本所在目录
-    os.chdir(BASE_DIR)
-    try:
-        srv = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-    except OSError as e:
-        print('端口 %s 起不来：%s\n换一个端口试试，例如：python qiwu7_server.py 9000' % (PORT, e))
-        sys.exit(1)
-
-    import socket
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        ip = '127.0.0.1'
-
-    print('=' * 62)
-    print('  栖梧7班班级管理系统 · 校园网服务端已启动（R24 数据槽版）')
-    print('=' * 62)
-    print('  本机访问：   http://127.0.0.1:%s' % PORT)
-    print('  局域网访问： http://%s:%s   ← 把这个地址发给老师 / 输进一体机' % (ip, PORT))
-    print('  班级口令：   %s' % TOKEN)
-    if TOKEN == 'qiwu7':
-        print('  ' + '!' * 58)
-        print('  !! 安全警告：你现在用的是【默认口令 qiwu7】')
-        print('  !! 这个口令是公开的（写在启动脚本和说明文档里），')
-        print('  !! 校园网内任何知道本机地址的人都能下载全班数据、')
-        print('  !! 给自己加分，甚至覆盖全班记录。')
-        print('  !! 强烈建议改掉（改完要重启本服务）：')
-        print('  !!   Windows: 改 启动_Windows.bat 第 13 行 set QIWU7_TOKEN=你的口令')
-        print('  !!   Linux:   QIWU7_TOKEN=你的口令 ./启动_Linux.sh')
-        print('  ' + '!' * 58)
-    print('  数据文件：   %s' % DATA_FILE)
-    print('  停止服务：   按 Ctrl + C（systemd 服务用 sudo systemctl stop qiwu7）')
-    print('=' * 62)
-    print('  提醒：第一次打开网页后，要去「设置 / 数据 → 🌐 校园网同步」')
-    print('        填上面的地址与口令，点「立即同步」，三端就通了。')
-    print('=' * 62)
-    sys.stdout.flush()          # 立刻显示，避免被输出缓冲吞掉
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print('\n已停止。')
-        srv.server_close()
-
-
-if __name__ == '__main__':
-    main()
+    global CURRENT,USERS,ALLOWED_HOSTS,STUDY
+    os.umask(0o077);PRIVATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    CURRENT=load_json('state.json');USERS=load_json('users.json')
+    STUDY=load_json('study.json') if (PRIVATE/'study.json').exists() else {}
+    if CURRENT.get('format')!=2:raise SystemExit('Refusing legacy unauthenticated storage')
+    ALLOWED_HOSTS=set(os.environ.get('QIWU7_ALLOWED_HOSTS','10.50.159.62:18090,localhost:%s,127.0.0.1:%s'%(PORT,PORT)).split(','))
+    bind=os.environ.get('QIWU7_BIND','0.0.0.0')
+    if REQUIRE_TLS and bind not in ['127.0.0.1','::1'] and not (TLS_CERT and TLS_KEY):raise SystemExit('TLS-required listener requires QIWU7_TLS_CERT and QIWU7_TLS_KEY')
+    if TRUST_PROXY and bind not in ['127.0.0.1','::1']:raise SystemExit('Trusted proxy requires loopback binding')
+    server=BoundedServer((bind,PORT),Handler)
+    if TLS_CERT and TLS_KEY:
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.minimum_version=ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(TLS_CERT,TLS_KEY);server.tls_context=context
+    audit('started',securityVersion=3,epoch=CURRENT['epoch'],rev=CURRENT['rev'],tls=bool(TLS_CERT))
+    print('Qiwu7 security v3 listening on port %s; TLS=%s'%(PORT,bool(TLS_CERT)),flush=True)
+    server.serve_forever()
+if __name__=='__main__':main()

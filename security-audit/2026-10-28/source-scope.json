@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-28",
+  "scope": "current uncommitted working tree; production source parity not verified",
+  "files": {
+    "qiwu7_server.py": "cc48c6bf14bc9570e65a0eca55db639d2572749801245971dab42cda855e2fd8",
+    "index.html": "d2ae079589280c561f3542ff7450f22fa6cc3cfd898e9430750720596cc7e294",
+    "tests/test_security.py": "6c19786532ef0f3753b97925639922f37e70a405234c5dc346e42e7748595ada",
+    "tests/test_sync.cjs": "14eac7d6d16be1718c0d2649c1fe23a5a1856f58a88c65a3dc3fef014f616d1f"
+  }
+}

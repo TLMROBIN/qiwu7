@@ -5,3 +5,9 @@ _body.html
 __pycache__/
 *.pyc
 .DS_Store
+
+# Sensitive runtime state must never be committed or served
+qiwu7_data/
+qiwu7_private/
+qiwu7.env
+*.log

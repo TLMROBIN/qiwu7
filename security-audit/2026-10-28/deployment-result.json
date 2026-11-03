@@ -1,0 +1,16 @@
+{
+  "deployed": true,
+  "securityVersion": 3,
+  "backup": "/home/yub/qiwu7-release-backups/pre-v3-20261028-214510",
+  "source_sha256": {
+    "qiwu7_server.py": "6b388f7c4aeda474fef237e0a9cb1756a4c0c45252380443154ac3bbebd45f3b",
+    "qiwu7_security.py": "d891274188b2945db5a45e42940ae39b38e130ccf465047757db8b4394ca9f73",
+    "index.html": "5868f9b40f8feb8dc72e312da966b684f66318140953d10d560a3438f216ecab"
+  },
+  "state_unchanged": true,
+  "users_unchanged": true,
+  "revision": 4147,
+  "students": 47,
+  "exams": 4,
+  "http_retained_by_request": true
+}

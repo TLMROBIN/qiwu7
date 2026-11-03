@@ -1,0 +1,41 @@
+{
+  "scope": "temporary localhost fixture only",
+  "confirmed": [
+    {
+      "finding": "unfiltered student reads",
+      "sync_status": 200,
+      "bootstrap_contains_other_feedback": true,
+      "other_exam_and_application_visible": true
+    },
+    {
+      "finding": "classroom overwrites teacher-only shared data",
+      "sync_status": 200,
+      "feedback_deleted": true,
+      "prize_cost_changed": true,
+      "application_status_changed": true
+    },
+    {
+      "finding": "unverified learning duration",
+      "sync_status": 200,
+      "minutes_on_one_day": 2880
+    },
+    {
+      "finding": "duplicate and backdated scoring",
+      "sync_status": 200,
+      "same_assignment_accepted": 3,
+      "arbitrary_week_persisted": true
+    },
+    {
+      "finding": "stored rendering denial and HTML injection",
+      "sync_status": 200,
+      "render_error": "TypeError: Cannot read properties of undefined (reading 'push')",
+      "raw_html_inserted": true
+    },
+    {
+      "finding": "backup storage amplification",
+      "accepted_writes": 3,
+      "backup_growth_bytes": 1005753,
+      "temporary_data_only": true
+    }
+  ]
+}

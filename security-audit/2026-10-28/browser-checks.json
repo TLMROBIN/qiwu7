@@ -1,0 +1,21 @@
+{
+  "scope": "isolated localhost server with synthetic accounts; final production login page read only",
+  "browser": "ego-browser Chromium",
+  "simulated_viewport": {"width": 800, "height": 1100},
+  "passed_flows": [
+    "student login",
+    "server timer start, pause, resume, stop",
+    "student feedback persists and is visible to teacher",
+    "teacher marks feedback read and state persists",
+    "logout and role switch",
+    "classroom public ranking loads",
+    "classroom score display has read-only notice and no edit or archive controls",
+    "no error banner or horizontal overflow on tested pages",
+    "original production HTTP URL displays login form"
+  ],
+  "limitations": [
+    "No real managed student tablet acceptance",
+    "No production attack writes or load testing",
+    "HTTP retained by user request; no certificate installed"
+  ]
+}

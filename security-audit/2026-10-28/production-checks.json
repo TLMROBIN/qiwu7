@@ -1,0 +1,46 @@
+{
+  "production_readonly_checks": [
+    {
+      "path": "/api/ping",
+      "status": 200
+    },
+    {
+      "path": "/",
+      "status": 200
+    },
+    {
+      "path": "/api/sync?token=retired-test",
+      "status": 401
+    },
+    {
+      "path": "/api/backup",
+      "status": 401
+    },
+    {
+      "path": "/api/study",
+      "status": 403
+    },
+    {
+      "path": "/qiwu7_server.py",
+      "status": 404
+    },
+    {
+      "path": "/qiwu7_security.py",
+      "status": 404
+    },
+    {
+      "path": "/qiwu7.env",
+      "status": 404
+    },
+    {
+      "path": "/qiwu7_data/data.json",
+      "status": 404
+    },
+    {
+      "path": "/.git/HEAD",
+      "status": 404
+    }
+  ],
+  "deployed_source_matches_local": true,
+  "tls_not_enabled_by_user_request": true
+}
