@@ -118,7 +118,7 @@ def read_view(current, session):
 FIELDS = {
     'records': 'id studentId weekKey type amount reason ts timeStr source attDate attKey autoAbsent cat sub notify batchId date operator reminder actorSid eventKey',
     'studentFeedbacks': 'id studentId sid name text ts timeStr read source',
-    'attendanceRemarks': 'id date session studentId text ts status',
+    'attendanceRemarks': 'id date session studentId text ts timeStr status',
     'studyLog': 'id sid date startTs endTs dur mode ts timeStr verified',
     'prizeOrders': 'id sid name prizeId prizeName cost ts timeStr status statusTs',
     'nominations': 'id sid name what amount why ts timeStr status statusTs approvedAmount recordId',
@@ -130,8 +130,11 @@ IDENTIFIERS = {'id', 'studentId', 'sid', 'fromSid', 'toSid', 'batchId', 'prizeId
 
 
 def schema(key, item):
-    if not isinstance(item, dict) or set(item) - set(FIELDS[key].split()):
-        raise Denied('记录包含不允许的字段')
+    if not isinstance(item, dict):
+        raise Denied('记录格式无效')
+    extra = set(item) - set(FIELDS[key].split())
+    if extra:
+        raise Denied('记录包含不允许的字段: ' + ','.join(sorted(extra))[:200])
     identifier(item.get('id'))
     for field, value in item.items():
         if field in IDENTIFIERS:
